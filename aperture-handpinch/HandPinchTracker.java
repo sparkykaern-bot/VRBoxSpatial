@@ -1,18 +1,20 @@
 package com.igalia.wolvic;
 
 import android.content.Context;
+import android.graphics.Bitmap;
 import android.media.Image;
 import android.os.SystemClock;
 import android.util.Log;
 
+import com.google.mediapipe.framework.image.BitmapImageBuilder;
 import com.google.mediapipe.framework.image.MPImage;
-import com.google.mediapipe.framework.image.MediaImageBuilder;
 import com.google.mediapipe.tasks.core.BaseOptions;
 import com.google.mediapipe.tasks.vision.core.ImageProcessingOptions;
 import com.google.mediapipe.tasks.vision.core.RunningMode;
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker;
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult;
 
+import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -27,8 +29,10 @@ public final class HandPinchTracker {
     }
 
     private static final String TAG = "ApertureHand";
-    private static final long MIN_FRAME_MS = 28L;
-    private static final long LOST_GRACE_MS = 180L;
+    // RGB conversion is intentionally capped around 20 fps. At the small analysis
+    // resolution this is responsive enough while remaining reliable on phones.
+    private static final long MIN_FRAME_MS = 50L;
+    private static final long LOST_GRACE_MS = 260L;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final AtomicBoolean busy = new AtomicBoolean(false);
@@ -37,6 +41,7 @@ public final class HandPinchTracker {
     private long lastSubmitMs, lastTimestampMs, lastSeenMs;
     private boolean lostNotified = true;
     private boolean pinchState, openState, cursorReady;
+    private boolean frameAnnounced, processingAnnounced, frameErrorAnnounced;
     private int pinchReleaseFrames, openFrames;
     private float smoothX=.5f, smoothY=.5f, lastX=.5f, lastY=.5f, velX, velY;
 
@@ -57,10 +62,10 @@ public final class HandPinchTracker {
                     .setMinTrackingConfidence(.32f)
                     .build();
             landmarker = HandLandmarker.createFromOptions(context, options);
-            listener.onStatus("Mão: pronta");
+            listener.onStatus("Mão: MediaPipe pronto");
         } catch (Throwable t) {
             Log.e(TAG, "MediaPipe init failed", t);
-            listener.onStatus("Mão: indisponível");
+            listener.onStatus("Mão: MediaPipe indisponível");
         }
     }
 
@@ -72,24 +77,106 @@ public final class HandPinchTracker {
             return;
         }
         lastSubmitMs = now;
+        if (!frameAnnounced) {
+            frameAnnounced = true;
+            listener.onStatus("Mão: frame da câmera recebido");
+        }
+
         executor.execute(() -> {
             MPImage mp = null;
+            Bitmap bitmap = null;
             try {
-                mp = new MediaImageBuilder(image).build();
+                // MediaImageBuilder/YUV is device-dependent. Converting the small
+                // analysis stream to RGB first is slower but much more portable.
+                bitmap = yuv420ToRgbBitmap(image);
+                if (bitmap == null) throw new IllegalStateException("YUV->RGB returned null");
+                if (!processingAnnounced) {
+                    processingAnnounced = true;
+                    listener.onStatus("Mão: RGB chegando ao MediaPipe");
+                }
+                mp = new BitmapImageBuilder(bitmap).build();
                 long ts = Math.max(lastTimestampMs+1L, Math.max(1L,timestampNs/1_000_000L));
                 lastTimestampMs = ts;
                 int rot = ((rotationDegrees%360)+360)%360;
                 ImageProcessingOptions proc = ImageProcessingOptions.builder().setRotationDegrees(rot).build();
                 parse(landmarker.detectForVideo(mp, proc, ts));
             } catch (Throwable t) {
-                Log.w(TAG,"Hand frame failed",t);
+                Log.w(TAG,"Hand RGB frame failed",t);
+                if (!frameErrorAnnounced) {
+                    frameErrorAnnounced = true;
+                    listener.onStatus("Mão: erro ao processar frame RGB");
+                }
                 noHand();
             } finally {
                 if (mp != null) try { mp.close(); } catch (Throwable ignored) {}
+                if (bitmap != null && !bitmap.isRecycled()) try { bitmap.recycle(); } catch (Throwable ignored) {}
                 try { image.close(); } catch (Throwable ignored) {}
                 busy.set(false);
             }
         });
+    }
+
+    /**
+     * Converts YUV_420_888 to a small RGB bitmap while respecting arbitrary row
+     * and pixel strides. The conversion downsamples during sampling instead of
+     * first allocating a full-resolution RGB frame.
+     */
+    private static Bitmap yuv420ToRgbBitmap(Image image) {
+        if (image.getFormat() != android.graphics.ImageFormat.YUV_420_888) {
+            throw new IllegalArgumentException("Unexpected format " + image.getFormat());
+        }
+        Image.Plane[] planes = image.getPlanes();
+        if (planes == null || planes.length < 3) throw new IllegalStateException("Missing YUV planes");
+
+        final int srcW = image.getWidth();
+        final int srcH = image.getHeight();
+        if (srcW <= 0 || srcH <= 0) throw new IllegalStateException("Invalid YUV size");
+
+        final int maxW = 320;
+        final int outW = Math.min(srcW, maxW);
+        final int outH = Math.max(1, Math.round(srcH * (outW / (float)srcW)));
+        final int[] argb = new int[outW * outH];
+
+        ByteBuffer yBuf = planes[0].getBuffer();
+        ByteBuffer uBuf = planes[1].getBuffer();
+        ByteBuffer vBuf = planes[2].getBuffer();
+        final int yRow = planes[0].getRowStride();
+        final int yPix = planes[0].getPixelStride();
+        final int uRow = planes[1].getRowStride();
+        final int uPix = planes[1].getPixelStride();
+        final int vRow = planes[2].getRowStride();
+        final int vPix = planes[2].getPixelStride();
+
+        for (int oy=0; oy<outH; oy++) {
+            int sy = Math.min(srcH-1, (int)((long)oy * srcH / outH));
+            int uvY = sy >> 1;
+            for (int ox=0; ox<outW; ox++) {
+                int sx = Math.min(srcW-1, (int)((long)ox * srcW / outW));
+                int uvX = sx >> 1;
+
+                int yi = sy * yRow + sx * yPix;
+                int ui = uvY * uRow + uvX * uPix;
+                int vi = uvY * vRow + uvX * vPix;
+                if (yi >= yBuf.limit() || ui >= uBuf.limit() || vi >= vBuf.limit()) continue;
+
+                int y = (yBuf.get(yi) & 0xff) - 16;
+                int u = (uBuf.get(ui) & 0xff) - 128;
+                int v = (vBuf.get(vi) & 0xff) - 128;
+                if (y < 0) y = 0;
+
+                int r = (298*y + 409*v + 128) >> 8;
+                int g = (298*y - 100*u - 208*v + 128) >> 8;
+                int b = (298*y + 516*u + 128) >> 8;
+                r = r < 0 ? 0 : Math.min(255, r);
+                g = g < 0 ? 0 : Math.min(255, g);
+                b = b < 0 ? 0 : Math.min(255, b);
+                argb[oy*outW + ox] = 0xff000000 | (r<<16) | (g<<8) | b;
+            }
+        }
+
+        Bitmap out = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888);
+        out.setPixels(argb, 0, outW, 0, 0, outW, outH);
+        return out;
     }
 
     private void parse(HandLandmarkerResult result) {
