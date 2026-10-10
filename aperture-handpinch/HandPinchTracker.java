@@ -29,8 +29,6 @@ public final class HandPinchTracker {
     }
 
     private static final String TAG = "ApertureHand";
-    // RGB conversion is intentionally capped around 20 fps. At the small analysis
-    // resolution this is responsive enough while remaining reliable on phones.
     private static final long MIN_FRAME_MS = 50L;
     private static final long LOST_GRACE_MS = 260L;
 
@@ -41,7 +39,7 @@ public final class HandPinchTracker {
     private long lastSubmitMs, lastTimestampMs, lastSeenMs;
     private boolean lostNotified = true;
     private boolean pinchState, openState, cursorReady;
-    private boolean frameAnnounced, processingAnnounced, frameErrorAnnounced;
+    private boolean frameAnnounced, processingAnnounced, frameErrorAnnounced, detectionAnnounced;
     private int pinchReleaseFrames, openFrames;
     private float smoothX=.5f, smoothY=.5f, lastX=.5f, lastY=.5f, velX, velY;
 
@@ -57,9 +55,9 @@ public final class HandPinchTracker {
                     .setBaseOptions(base)
                     .setRunningMode(RunningMode.VIDEO)
                     .setNumHands(1)
-                    .setMinHandDetectionConfidence(.34f)
-                    .setMinHandPresenceConfidence(.35f)
-                    .setMinTrackingConfidence(.32f)
+                    .setMinHandDetectionConfidence(.25f)
+                    .setMinHandPresenceConfidence(.25f)
+                    .setMinTrackingConfidence(.25f)
                     .build();
             landmarker = HandLandmarker.createFromOptions(context, options);
             listener.onStatus("Mão: MediaPipe pronto");
@@ -86,8 +84,6 @@ public final class HandPinchTracker {
             MPImage mp = null;
             Bitmap bitmap = null;
             try {
-                // MediaImageBuilder/YUV is device-dependent. Converting the small
-                // analysis stream to RGB first is slower but much more portable.
                 bitmap = yuv420ToRgbBitmap(image);
                 if (bitmap == null) throw new IllegalStateException("YUV->RGB returned null");
                 if (!processingAnnounced) {
@@ -116,11 +112,6 @@ public final class HandPinchTracker {
         });
     }
 
-    /**
-     * Converts YUV_420_888 to a small RGB bitmap while respecting arbitrary row
-     * and pixel strides. The conversion downsamples during sampling instead of
-     * first allocating a full-resolution RGB frame.
-     */
     private static Bitmap yuv420ToRgbBitmap(Image image) {
         if (image.getFormat() != android.graphics.ImageFormat.YUV_420_888) {
             throw new IllegalArgumentException("Unexpected format " + image.getFormat());
@@ -185,21 +176,41 @@ public final class HandPinchTracker {
         if (lm.size() < 21) { noHand(); return; }
         lastSeenMs = SystemClock.elapsedRealtime();
         lostNotified = false;
+        if (!detectionAnnounced) {
+            detectionAnnounced = true;
+            listener.onStatus("Mão: detectada");
+        }
 
         float wx=lm.get(0).x(), wy=lm.get(0).y();
-        float palm=Math.max(.028f, distance(lm,0,9));
-        float pinchRatio=distance(lm,4,8)/palm;
-        if (!pinchState && pinchRatio < .49f) { pinchState=true; pinchReleaseFrames=0; }
-        else if (pinchState && pinchRatio > .68f) {
-            if (++pinchReleaseFrames >= 2) { pinchState=false; pinchReleaseFrames=0; }
-        } else pinchReleaseFrames=0;
+
+        // Use palm WIDTH as the scale reference. Wrist->middle-MCP changes a lot
+        // with perspective and was causing valid pinches to never enter the state.
+        float palmWidth = Math.max(.035f, distance(lm,5,17));
+        float tipDistance = distance(lm,4,8);
+        float pinchRatio = tipDistance / palmWidth;
+
+        // Hysteresis: easy to press, harder to release. Also allow a small
+        // absolute threshold for hands that are very close to the camera.
+        boolean wantsPinch = tipDistance < .055f || pinchRatio < .58f;
+        boolean wantsRelease = tipDistance > .080f && pinchRatio > .82f;
+        if (!pinchState && wantsPinch) {
+            pinchState = true;
+            pinchReleaseFrames = 0;
+        } else if (pinchState && wantsRelease) {
+            if (++pinchReleaseFrames >= 2) {
+                pinchState = false;
+                pinchReleaseFrames = 0;
+            }
+        } else {
+            pinchReleaseFrames = 0;
+        }
 
         int extended=0;
         if (extended(lm,8,6,wx,wy)) extended++;
         if (extended(lm,12,10,wx,wy)) extended++;
         if (extended(lm,16,14,wx,wy)) extended++;
         if (extended(lm,20,18,wx,wy)) extended++;
-        boolean wantsOpen=!pinchState && extended>=3 && pinchRatio>.72f;
+        boolean wantsOpen=!pinchState && extended>=3 && pinchRatio>.90f;
         if (wantsOpen) { if (++openFrames>=2) openState=true; }
         else { openFrames=0; openState=false; }
         if (pinchState) openState=false;
@@ -226,6 +237,7 @@ public final class HandPinchTracker {
         long now=SystemClock.elapsedRealtime();
         if (lastSeenMs==0 || now-lastSeenMs>LOST_GRACE_MS) {
             pinchState=false; openState=false; pinchReleaseFrames=openFrames=0; cursorReady=false;
+            detectionAnnounced=false;
             if (!lostNotified) { lostNotified=true; listener.onHandLost(); }
         }
     }
