@@ -30,14 +30,16 @@ final class SpatialOverlayView extends View {
     }
 
     private static final float IPD_METERS = 0.056f;
-    private static final long INVALID_HOLD_MS = 520;
+    private static final long INVALID_HOLD_MS = 800;
 
     private static final class Projected {
         final SpatialWindow win;
         final RectF rect;
         final float depth;
         Projected(SpatialWindow win, RectF rect, float depth) {
-            this.win = win; this.rect = rect; this.depth = depth;
+            this.win = win;
+            this.rect = rect;
+            this.depth = depth;
         }
     }
 
@@ -52,6 +54,10 @@ final class SpatialOverlayView extends View {
     private final Map<String, RectF> leftHitRects = new HashMap<>();
 
     private Pose cameraPose = Pose.IDENTITY;
+    private Pose lastMeasuredPose = Pose.IDENTITY;
+    private boolean measuredPoseReady;
+    private long lastPoseMs;
+    private int intentionalMotionFrames;
     private boolean tracking;
     private float projectionX = 1.20f;
     private float projectionY = 1.75f;
@@ -106,11 +112,40 @@ final class SpatialOverlayView extends View {
     }
 
     void updateCameraPose(Pose pose, boolean isTracking) {
-        if (isTracking && pose != null) cameraPose = pose;
-        tracking = isTracking;
-        arStatus = tracking ? "ARCore: 6DoF estável" : "ARCore: mantendo última pose";
-        frames++;
         long now = SystemClock.elapsedRealtime();
+        if (isTracking && pose != null) {
+            if (!measuredPoseReady) {
+                cameraPose = pose;
+                lastMeasuredPose = pose;
+                lastPoseMs = now;
+                measuredPoseReady = true;
+                intentionalMotionFrames = 0;
+            } else {
+                float dt = Math.max(.001f, (now - lastPoseMs) / 1000f);
+                float linearSpeed = translationDelta(lastMeasuredPose, pose) / dt;
+                float angularSpeed = rotationDeltaDeg(lastMeasuredPose, pose) / dt;
+
+                // ARCore often makes very slow mapping corrections even when the phone is still.
+                // Reject those before projection. Real head turns are much faster and pass after
+                // two consecutive frames, avoiding both creep and one-frame relocalization jumps.
+                boolean deliberate = linearSpeed > .012f || angularSpeed > 1.25f ||
+                        dragged != null || resized != null || browserGesture;
+                if (deliberate) intentionalMotionFrames = Math.min(4, intentionalMotionFrames + 1);
+                else intentionalMotionFrames = Math.max(0, intentionalMotionFrames - 1);
+
+                if (intentionalMotionFrames >= 2) cameraPose = pose;
+                lastMeasuredPose = pose;
+                lastPoseMs = now;
+            }
+        } else {
+            intentionalMotionFrames = 0;
+        }
+
+        tracking = isTracking;
+        arStatus = tracking
+                ? (intentionalMotionFrames >= 2 ? "ARCore: movimento" : "ARCore: WORLD LOCK")
+                : "ARCore: mantendo última pose";
+        frames++;
         if (lastFrameMs == 0) lastFrameMs = now;
         if (now - lastFrameMs >= 1000) {
             fps = frames;
@@ -135,10 +170,10 @@ final class SpatialOverlayView extends View {
         float tx = clamp01(nx), ty = clamp01(ny);
         openHand = isOpenHand;
         if (!handInitialized) {
-            handX = tx; handY = ty; handInitialized = true;
+            handX = tx;
+            handY = ty;
+            handInitialized = true;
         } else {
-            // HandTracker already performs temporal filtering. Keep only a light display filter so
-            // the cursor remains responsive instead of accumulating latency in two places.
             float a = isPinch ? .58f : (isOpenHand ? .48f : .74f);
             handX += (tx - handX) * a;
             handY += (ty - handY) * a;
@@ -232,12 +267,29 @@ final class SpatialOverlayView extends View {
 
     private Projected project(SpatialWindow w, int eyeW, int h, float eyeSign, int eyeIndex) {
         String key = w.id + (eyeIndex == 0 ? ":L" : ":R");
-        if (w.anchor == null || w.anchor.getTrackingState() != TrackingState.TRACKING || !tracking) {
-            return heldProjection(w, key);
+        if (!tracking) return heldProjection(w, key);
+
+        Pose worldPose;
+        if (w.worldLocked) {
+            // Snapshot once per Anchor generation, then completely ignore slow Anchor pose
+            // refinements until the user actually places the window somewhere else.
+            if (w.lockedPose == null || w.lockedFromAnchor != w.anchor) {
+                if (w.anchor == null || w.anchor.getTrackingState() != TrackingState.TRACKING) {
+                    return heldProjection(w, key);
+                }
+                w.lockToCurrentAnchor();
+            }
+            worldPose = w.lockedPose;
+        } else {
+            if (w.anchor == null || w.anchor.getTrackingState() != TrackingState.TRACKING) {
+                return heldProjection(w, key);
+            }
+            worldPose = w.anchor.getPose();
         }
+        if (worldPose == null) return heldProjection(w, key);
 
         Pose eyePose = cameraPose.compose(Pose.makeTranslation(eyeSign * IPD_METERS * .5f, 0f, 0f));
-        float[] world = w.anchor.getPose().getTranslation();
+        float[] world = worldPose.getTranslation();
         float[] local = eyePose.inverse().transformPoint(world);
         float z = -local[2];
         if (z < .20f || z > 8f) return heldProjection(w, key);
@@ -267,8 +319,6 @@ final class SpatialOverlayView extends View {
             target.offset((handX-dragStartHandX)*eyeW, (handY-dragStartHandY)*h);
         }
 
-        // Do not instantly discard a window near the edge. Only consider it truly out of view
-        // when its whole rectangle is far beyond the lens image.
         float mx = eyeW * .32f;
         float my = h * .30f;
         if (target.right < -mx || target.left > eyeW + mx || target.bottom < -my || target.top > h + my) {
@@ -302,8 +352,6 @@ final class SpatialOverlayView extends View {
 
         float jump = (float)Math.hypot(target.centerX()-old.centerX(), target.centerY()-old.centerY());
         float sizeJump = Math.abs(target.width()-old.width()) / Math.max(1f, old.width());
-
-        // Strong stationary dead zone; adaptive response when the user actually moves their head.
         if (jump < 2.2f && sizeJump < .006f) return new RectF(old);
 
         float a;
@@ -342,7 +390,6 @@ final class SpatialOverlayView extends View {
         stroke.setColor(liveBrowser ? 0x9adcefff : 0x55cde8ff);
         c.drawRoundRect(r, radius, radius, stroke);
 
-        // Glass-like top highlight helps the cards read as objects floating in space.
         p.setShader(new LinearGradient(r.left, r.top, r.left, r.top + r.height()*.28f,
                 0x24ffffff, 0x00ffffff, Shader.TileMode.CLAMP));
         c.drawRoundRect(r, radius, radius, p);
@@ -433,7 +480,7 @@ final class SpatialOverlayView extends View {
         p.setColor(Color.WHITE); p.setTextSize(Math.max(11f,H*.024f));
         c.drawText(calibrationMode?"CALIBRAÇÃO VR BOX":"AJUSTES VR BOX",r.left+14,r.top+26,p);
         p.setTextSize(Math.max(9f,H*.017f)); p.setColor(0xd0ffffff);
-        c.drawText("Projeção ARCore real • vIPD 56 mm",r.left+14,r.top+52,p);
+        c.drawText("Projeção ARCore real • WORLD LOCK • vIPD 56 mm",r.left+14,r.top+52,p);
         c.drawText(ellipsize(opticsStatus,54),r.left+14,r.top+75,p);
         c.drawText("CAL: FUSÃO H → V → CENTRO → ZOOM",r.left+14,r.top+98,p);
         c.drawText("Volume − / + ajusta e salva",r.left+14,r.top+121,p);
@@ -584,6 +631,21 @@ final class SpatialOverlayView extends View {
         if(w.kind==SpatialWindow.Kind.BROWSER)return 1.06f;
         if(w.kind==SpatialWindow.Kind.MEDIA)return 1.14f;
         return 1.14f;
+    }
+
+    private static float translationDelta(Pose a, Pose b) {
+        float[] aa = a.getTranslation();
+        float[] bb = b.getTranslation();
+        float dx = aa[0]-bb[0], dy = aa[1]-bb[1], dz = aa[2]-bb[2];
+        return (float)Math.sqrt(dx*dx + dy*dy + dz*dz);
+    }
+
+    private static float rotationDeltaDeg(Pose a, Pose b) {
+        float[] qa = a.getRotationQuaternion();
+        float[] qb = b.getRotationQuaternion();
+        float dot = Math.abs(qa[0]*qb[0] + qa[1]*qb[1] + qa[2]*qb[2] + qa[3]*qb[3]);
+        dot = clamp(dot, -1f, 1f);
+        return (float)Math.toDegrees(2.0 * Math.acos(dot));
     }
 
     private static String ellipsize(String s,int max){if(s==null)return"";return s.length()<=max?s:s.substring(0,Math.max(1,max-1))+"…";}
