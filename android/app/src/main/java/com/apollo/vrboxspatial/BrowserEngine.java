@@ -6,7 +6,6 @@ import android.graphics.RectF;
 import android.net.Uri;
 import android.os.Handler;
 import android.os.Looper;
-import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.webkit.CookieManager;
@@ -22,7 +21,7 @@ final class BrowserEngine {
 
     private static final String HOME = "https://m.youtube.com/";
     private static final int LOGICAL_W = 960;
-    private static final int LOGICAL_H = 600;
+    private static final int LOGICAL_H = 540;
 
     private final Activity activity;
     private final Listener listener;
@@ -32,6 +31,8 @@ final class BrowserEngine {
 
     private boolean running = true;
     private String currentUrl = HOME;
+    private final RectF lastLeft = new RectF(Float.NaN, Float.NaN, Float.NaN, Float.NaN);
+    private final RectF lastRight = new RectF(Float.NaN, Float.NaN, Float.NaN, Float.NaN);
 
     BrowserEngine(Activity activity, FrameLayout root, Listener listener) {
         this.activity = activity;
@@ -44,7 +45,8 @@ final class BrowserEngine {
         left.setVisibility(View.GONE);
         right.setVisibility(View.GONE);
 
-        loadBoth(HOME);
+        left.loadUrl(HOME);
+        handler.postDelayed(() -> right.loadUrl(HOME), 180);
         handler.post(mirrorMaintenance);
     }
 
@@ -61,8 +63,8 @@ final class BrowserEngine {
         s.setUseWideViewPort(true);
         s.setLoadWithOverviewMode(true);
         s.setLayoutAlgorithm(WebSettings.LayoutAlgorithm.NORMAL);
-        s.setTextZoom(90);
-        s.setDefaultFontSize(14);
+        s.setTextZoom(95);
+        s.setDefaultFontSize(15);
         s.setSupportMultipleWindows(false);
         s.setJavaScriptCanOpenWindowsAutomatically(true);
         s.setLoadsImagesAutomatically(true);
@@ -76,7 +78,7 @@ final class BrowserEngine {
         CookieManager.getInstance().setAcceptCookie(true);
         CookieManager.getInstance().setAcceptThirdPartyCookies(w, true);
 
-        w.setInitialScale(82);
+        w.setInitialScale(100);
         w.setBackgroundColor(Color.BLACK);
         w.setLayerType(View.LAYER_TYPE_HARDWARE, null);
         w.setOverScrollMode(View.OVER_SCROLL_NEVER);
@@ -98,14 +100,14 @@ final class BrowserEngine {
             @Override public void doUpdateVisitedHistory(WebView view, String url, boolean isReload) {
                 if (!mirrorEye && url != null && !url.isBlank()) {
                     currentUrl = url;
-                    handler.postDelayed(BrowserEngine.this::syncMirrorUrl, 140);
+                    handler.postDelayed(BrowserEngine.this::syncMirrorUrl, 220);
                 }
             }
 
             @Override public void onPageFinished(WebView view, String url) {
                 tunePage(view);
                 if (mirrorEye) muteMirror();
-                else handler.postDelayed(BrowserEngine.this::syncMirrorState, 220);
+                else handler.postDelayed(BrowserEngine.this::syncMirrorState, 420);
             }
         });
 
@@ -124,9 +126,12 @@ final class BrowserEngine {
             String js = "(function(){" +
                     "var m=document.querySelector('meta[name=viewport]');" +
                     "if(!m){m=document.createElement('meta');m.name='viewport';document.head.appendChild(m);}" +
-                    "m.setAttribute('content','width=960,initial-scale=0.82,maximum-scale=0.82,user-scalable=no');" +
+                    "m.setAttribute('content','width=960,initial-scale=1,maximum-scale=1,user-scalable=no');" +
                     "document.documentElement.style.background='#000';" +
                     "if(document.body)document.body.style.background='#000';" +
+                    "document.querySelectorAll('video').forEach(function(v){" +
+                    "v.setAttribute('playsinline','true');v.setAttribute('webkit-playsinline','true');" +
+                    "v.style.objectFit='contain';});" +
                     "})();";
             view.evaluateJavascript(js, null);
         } catch (Throwable ignored) { }
@@ -138,8 +143,19 @@ final class BrowserEngine {
             hide();
             return;
         }
-        applyTransform(left, leftRect);
-        applyTransform(right, rightRect);
+        if (!nearlySame(lastLeft, leftRect)) {
+            lastLeft.set(leftRect);
+            applyTransform(left, leftRect);
+        } else if (left.getVisibility() != View.VISIBLE) {
+            left.setVisibility(View.VISIBLE);
+        }
+
+        if (!nearlySame(lastRight, rightRect)) {
+            lastRight.set(rightRect);
+            applyTransform(right, rightRect);
+        } else if (right.getVisibility() != View.VISIBLE) {
+            right.setVisibility(View.VISIBLE);
+        }
     }
 
     private void applyTransform(WebView view, RectF r) {
@@ -174,14 +190,14 @@ final class BrowserEngine {
     void back() {
         activity.runOnUiThread(() -> {
             if (left.canGoBack()) left.goBack();
-            handler.postDelayed(this::syncMirrorUrl, 180);
+            handler.postDelayed(this::syncMirrorUrl, 260);
         });
     }
 
     void reload() {
         activity.runOnUiThread(() -> {
             left.reload();
-            right.reload();
+            handler.postDelayed(right::reload, 140);
         });
     }
 
@@ -190,7 +206,9 @@ final class BrowserEngine {
     private void loadBoth(String url) {
         currentUrl = url;
         left.loadUrl(url);
-        right.loadUrl(url);
+        handler.postDelayed(() -> {
+            if (running) right.loadUrl(url);
+        }, 140);
     }
 
     private void syncMirrorUrl() {
@@ -201,53 +219,38 @@ final class BrowserEngine {
         if (currentUrl != null && !sameUrl(currentUrl, ru)) right.loadUrl(currentUrl);
     }
 
+    // DOM hit testing is much more reliable than dispatching Android MotionEvents into a WebView
+    // that is currently scaled and translated inside a spatial window.
     void tap(float nx, float ny) {
-        final float x = clamp01(nx) * LOGICAL_W;
-        final float y = clamp01(ny) * LOGICAL_H;
+        final float x = clamp01(nx);
+        final float y = clamp01(ny);
         activity.runOnUiThread(() -> {
-            dispatchTap(left, x, y);
-            handler.postDelayed(this::syncMirrorUrl, 220);
-            handler.postDelayed(this::syncMirrorState, 330);
+            String js = "(function(){" +
+                    "var x=window.innerWidth*" + x + ",y=window.innerHeight*" + y + ";" +
+                    "var e=document.elementFromPoint(x,y);if(!e)return 'none';" +
+                    "var t=e.closest?e.closest('a,button,[role=button],input,video,[tabindex]'):e;" +
+                    "if(!t)t=e;" +
+                    "try{t.dispatchEvent(new MouseEvent('mousedown',{bubbles:true,clientX:x,clientY:y}));" +
+                    "t.dispatchEvent(new MouseEvent('mouseup',{bubbles:true,clientX:x,clientY:y}));t.click();}catch(_){try{t.click();}catch(__){}}" +
+                    "return (t.tagName||'ok');})();";
+            left.evaluateJavascript(js, value -> {
+                handler.postDelayed(this::syncMirrorUrl, 280);
+                handler.postDelayed(this::syncMirrorState, 520);
+            });
         });
     }
 
-    private void dispatchTap(WebView view, float x, float y) {
-        long t = android.os.SystemClock.uptimeMillis();
-        MotionEvent down = MotionEvent.obtain(t, t, MotionEvent.ACTION_DOWN, x, y, 0);
-        MotionEvent up = MotionEvent.obtain(t, t + 90, MotionEvent.ACTION_UP, x, y, 0);
-        view.dispatchTouchEvent(down);
-        view.dispatchTouchEvent(up);
-        down.recycle();
-        up.recycle();
-    }
-
+    // Spatial drag is used mainly for scrolling. Doing the scroll in page coordinates avoids the
+    // mismatch between transformed view pixels and CSS pixels that caused missed/erratic swipes.
     void drag(float fromNx, float fromNy, float toNx, float toNy) {
-        final float x0 = clamp01(fromNx) * LOGICAL_W;
-        final float y0 = clamp01(fromNy) * LOGICAL_H;
-        final float x1 = clamp01(toNx) * LOGICAL_W;
-        final float y1 = clamp01(toNy) * LOGICAL_H;
+        final float dy = clamp(fromNy - toNy, -1f, 1f);
         activity.runOnUiThread(() -> {
-            dispatchDrag(left, x0, y0, x1, y1);
-            handler.postDelayed(this::syncScroll, 100);
-            handler.postDelayed(this::syncMirrorState, 180);
+            String js = "(function(){window.scrollBy(0,window.innerHeight*" + (dy * 1.12f) + ");return window.scrollY;})();";
+            left.evaluateJavascript(js, value -> {
+                handler.postDelayed(this::syncScroll, 100);
+                handler.postDelayed(this::syncMirrorState, 360);
+            });
         });
-    }
-
-    private void dispatchDrag(WebView view, float x0, float y0, float x1, float y1) {
-        long t = android.os.SystemClock.uptimeMillis();
-        MotionEvent down = MotionEvent.obtain(t, t, MotionEvent.ACTION_DOWN, x0, y0, 0);
-        MotionEvent move1 = MotionEvent.obtain(t, t + 50, MotionEvent.ACTION_MOVE,
-                x0 + (x1-x0)*.30f, y0 + (y1-y0)*.30f, 0);
-        MotionEvent move2 = MotionEvent.obtain(t, t + 95, MotionEvent.ACTION_MOVE,
-                x0 + (x1-x0)*.68f, y0 + (y1-y0)*.68f, 0);
-        MotionEvent move3 = MotionEvent.obtain(t, t + 140, MotionEvent.ACTION_MOVE, x1, y1, 0);
-        MotionEvent up = MotionEvent.obtain(t, t + 180, MotionEvent.ACTION_UP, x1, y1, 0);
-        view.dispatchTouchEvent(down);
-        view.dispatchTouchEvent(move1);
-        view.dispatchTouchEvent(move2);
-        view.dispatchTouchEvent(move3);
-        view.dispatchTouchEvent(up);
-        down.recycle(); move1.recycle(); move2.recycle(); move3.recycle(); up.recycle();
     }
 
     private void syncScroll() {
@@ -274,9 +277,9 @@ final class BrowserEngine {
                             boolean paused = "1".equals(parts[1]);
                             double rate = Double.parseDouble(parts[2]);
                             String js = "(function(){var v=document.querySelector('video');if(!v)return;" +
-                                    "if(Math.abs((v.currentTime||0)-" + t + ")>.25)v.currentTime=" + t + ";" +
+                                    "if(Math.abs((v.currentTime||0)-" + t + ")>.85)v.currentTime=" + t + ";" +
                                     "v.playbackRate=" + rate + ";v.muted=true;" +
-                                    (paused ? "v.pause();" : "v.play().catch(function(){});") +
+                                    (paused ? "if(!v.paused)v.pause();" : "if(v.paused)v.play().catch(function(){});") +
                                     "})()";
                             right.evaluateJavascript(js, null);
                         } catch (Throwable ignored) { }
@@ -288,7 +291,7 @@ final class BrowserEngine {
         @Override public void run() {
             if (!running) return;
             syncMirrorState();
-            handler.postDelayed(this, 450);
+            handler.postDelayed(this, 900);
         }
     };
 
@@ -316,6 +319,14 @@ final class BrowserEngine {
         } catch (Throwable ignored) { }
     }
 
+    private static boolean nearlySame(RectF a, RectF b) {
+        return !Float.isNaN(a.left) &&
+                Math.abs(a.left - b.left) < .8f &&
+                Math.abs(a.top - b.top) < .8f &&
+                Math.abs(a.right - b.right) < .8f &&
+                Math.abs(a.bottom - b.bottom) < .8f;
+    }
+
     private static boolean sameUrl(String a, String b) {
         if (a == null || b == null) return false;
         int ha = a.indexOf('#'); if (ha >= 0) a = a.substring(0, ha);
@@ -323,5 +334,6 @@ final class BrowserEngine {
         return a.equals(b);
     }
 
-    private static float clamp01(float v) { return Math.max(0f, Math.min(1f, v)); }
+    private static float clamp(float v, float lo, float hi) { return Math.max(lo, Math.min(hi, v)); }
+    private static float clamp01(float v) { return clamp(v, 0f, 1f); }
 }
