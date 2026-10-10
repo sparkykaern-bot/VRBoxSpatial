@@ -9,6 +9,7 @@ import android.media.Image;
 import android.os.Bundle;
 import android.util.Range;
 import android.util.Size;
+import android.view.KeyEvent;
 import android.view.Surface;
 import android.view.View;
 import android.view.WindowManager;
@@ -54,7 +55,6 @@ public class MainActivity extends Activity implements
     private boolean uiBuilt;
     private boolean anchorsReady;
     private String cameraStatus = "Câmera AR: automática";
-    private long lastAnchorMoveMs;
 
     private final Object windowLock = new Object();
     private final List<SpatialWindow> windows = new ArrayList<>();
@@ -93,7 +93,6 @@ public class MainActivity extends Activity implements
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT));
 
-        // Live browser surfaces are inserted above the camera surface and below the spatial UI.
         browser = new BrowserEngine(this, root, title -> {
             if (overlay != null) runOnUiThread(() -> overlay.setBrowserTitle(title));
         });
@@ -119,16 +118,14 @@ public class MainActivity extends Activity implements
     private void createWindowModels() {
         synchronized (windowLock) {
             windows.clear();
-            // Distances are deliberately around 1 meter: a large floating monitor rather than a
-            // tiny panel meters away. depthMeters is also the stable drag plane for each window.
             windows.add(new SpatialWindow("browser-main", "YouTube / Navegador", SpatialWindow.Kind.BROWSER,
-                    .98f, .64f, .95f));
+                    1.10f, .70f, .84f));
             windows.add(new SpatialWindow("media", "YouTube", SpatialWindow.Kind.MEDIA,
-                    .62f, .38f, 1.05f));
+                    .66f, .40f, .94f));
             windows.add(new SpatialWindow("notes", "Notas", SpatialWindow.Kind.NOTES,
-                    .62f, .42f, 1.10f));
+                    .64f, .42f, 1.00f));
             windows.add(new SpatialWindow("system", "Sistema", SpatialWindow.Kind.SYSTEM,
-                    .64f, .40f, 1.10f));
+                    .66f, .42f, 1.00f));
         }
     }
 
@@ -163,6 +160,18 @@ public class MainActivity extends Activity implements
         }
         if (arSession != null) arSession.close();
         super.onDestroy();
+    }
+
+    @Override public boolean onKeyDown(int keyCode, KeyEvent event) {
+        if (overlay != null && renderer != null && overlay.isCalibrationMode()) {
+            if (keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
+                renderer.adjustAlignment(keyCode == KeyEvent.KEYCODE_VOLUME_UP ? 1 : -1);
+                overlay.setOpticsStatus(renderer.opticsStatus());
+                Toast.makeText(this, renderer.opticsStatus(), Toast.LENGTH_SHORT).show();
+                return true;
+            }
+        }
+        return super.onKeyDown(keyCode, event);
     }
 
     private boolean ensureArSession() {
@@ -326,13 +335,10 @@ public class MainActivity extends Activity implements
         if (arSession == null) return;
         synchronized (windowLock) {
             if (windows.size() < 4) return;
-
-            // Main screen centered and close. Side panels are slightly farther and offset so they
-            // read as a spatial workspace instead of four flat cards on one plane.
-            setAnchor(windows.get(0), pose.compose(Pose.makeTranslation(0f, -.02f, -.95f)));
-            setAnchor(windows.get(1), pose.compose(Pose.makeTranslation(.67f, .02f, -1.05f)));
-            setAnchor(windows.get(2), pose.compose(Pose.makeTranslation(-.72f, .28f, -1.10f)));
-            setAnchor(windows.get(3), pose.compose(Pose.makeTranslation(.72f, .30f, -1.10f)));
+            setAnchor(windows.get(0), pose.compose(Pose.makeTranslation(0f, -.02f, -.84f)));
+            setAnchor(windows.get(1), pose.compose(Pose.makeTranslation(.62f, .03f, -.94f)));
+            setAnchor(windows.get(2), pose.compose(Pose.makeTranslation(-.66f, .26f, -1.00f)));
+            setAnchor(windows.get(3), pose.compose(Pose.makeTranslation(.66f, .27f, -1.00f)));
             anchorsReady = true;
         }
         runOnUiThread(() -> overlay.setWindows(windows));
@@ -364,22 +370,20 @@ public class MainActivity extends Activity implements
     }
 
     @Override public void moveWindowToScreen(SpatialWindow window, float nx, float ny) {
-        if (glView == null || arSession == null || overlay == null) return;
+        if (glView == null || arSession == null || overlay == null || window == null) return;
 
-        long now = android.os.SystemClock.elapsedRealtime();
-        if (now - lastAnchorMoveMs < 75) return;
-        lastAnchorMoveMs = now;
-
-        final float[] ray = overlay.screenRay(nx, ny);
+        final float safeX = clamp(nx, .14f, .86f);
+        final float safeY = clamp(ny, .14f, .80f);
+        final float[] ray = overlay.screenRay(safeX, safeY);
         final float depth = overlay.depthFor(window);
         final Pose pose = overlay.cameraPose();
 
         glView.queueEvent(() -> {
-            // Use a fixed comfort depth. x/y follow the hand ray, z does not drift with hand noise.
-            float rayZ = Math.max(.15f, -ray[2]);
+            float rayZ = Math.max(.22f, -ray[2]);
             float scale = depth / rayZ;
-            float[] local = {ray[0] * scale, ray[1] * scale, -depth};
-            float[] world = pose.transformPoint(local);
+            float localX = clamp(ray[0] * scale, -depth*.68f, depth*.68f);
+            float localY = clamp(ray[1] * scale, -depth*.46f, depth*.46f);
+            float[] world = pose.transformPoint(new float[]{localX, localY, -depth});
 
             synchronized (windowLock) {
                 if (window.anchor != null) window.anchor.detach();
@@ -412,10 +416,10 @@ public class MainActivity extends Activity implements
                         "browser-" + System.currentTimeMillis(),
                         "Navegador",
                         SpatialWindow.Kind.BROWSER,
-                        .82f,
-                        .54f,
-                        1.05f);
-                Pose wp = pose.compose(Pose.makeTranslation(.35f, -.22f, -1.05f));
+                        .92f,
+                        .60f,
+                        .90f);
+                Pose wp = pose.compose(Pose.makeTranslation(.28f, -.20f, -.90f));
                 w.anchor = arSession.createAnchor(Pose.makeTranslation(wp.tx(), wp.ty(), wp.tz()));
                 windows.add(w);
             }
@@ -453,5 +457,9 @@ public class MainActivity extends Activity implements
 
     @Override public void onWindowVisibilityChanged() {
         if (overlay != null) overlay.invalidate();
+    }
+
+    private static float clamp(float v, float lo, float hi) {
+        return Math.max(lo, Math.min(hi, v));
     }
 }
