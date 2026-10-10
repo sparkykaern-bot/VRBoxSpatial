@@ -20,12 +20,9 @@ import android.widget.FrameLayout;
 final class BrowserEngine {
     interface Listener { void onTitleChanged(String title); }
 
-    private static final String HOME = "https://www.youtube.com/";
-    private static final int LOGICAL_W = 1280;
-    private static final int LOGICAL_H = 768;
-    private static final String DESKTOP_UA =
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
-            "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
+    private static final String HOME = "https://m.youtube.com/";
+    private static final int LOGICAL_W = 960;
+    private static final int LOGICAL_H = 600;
 
     private final Activity activity;
     private final Listener listener;
@@ -72,12 +69,14 @@ final class BrowserEngine {
         s.setCacheMode(WebSettings.LOAD_DEFAULT);
         s.setAllowContentAccess(true);
         s.setAllowFileAccess(false);
-        s.setUserAgentString(DESKTOP_UA);
+
+        String ua = WebSettings.getDefaultUserAgent(activity);
+        if (ua != null) s.setUserAgentString(ua.replace("; wv", ""));
 
         CookieManager.getInstance().setAcceptCookie(true);
         CookieManager.getInstance().setAcceptThirdPartyCookies(w, true);
 
-        w.setInitialScale(0);
+        w.setInitialScale(82);
         w.setBackgroundColor(Color.BLACK);
         w.setLayerType(View.LAYER_TYPE_HARDWARE, null);
         w.setOverScrollMode(View.OVER_SCROLL_NEVER);
@@ -85,6 +84,7 @@ final class BrowserEngine {
         w.setVerticalScrollBarEnabled(false);
         w.setPivotX(0f);
         w.setPivotY(0f);
+
         if (mirrorEye) {
             w.setClickable(false);
             w.setFocusable(false);
@@ -124,7 +124,7 @@ final class BrowserEngine {
             String js = "(function(){" +
                     "var m=document.querySelector('meta[name=viewport]');" +
                     "if(!m){m=document.createElement('meta');m.name='viewport';document.head.appendChild(m);}" +
-                    "m.setAttribute('content','width=1280,initial-scale=1,maximum-scale=1,user-scalable=no');" +
+                    "m.setAttribute('content','width=960,initial-scale=0.82,maximum-scale=0.82,user-scalable=no');" +
                     "document.documentElement.style.background='#000';" +
                     "if(document.body)document.body.style.background='#000';" +
                     "})();";
@@ -163,7 +163,7 @@ final class BrowserEngine {
             if (u.isEmpty()) return;
             if (!u.startsWith("http://") && !u.startsWith("https://")) {
                 if (u.contains(".") && !u.contains(" ")) u = "https://" + u;
-                else u = "https://www.youtube.com/results?search_query=" + Uri.encode(u);
+                else u = "https://m.youtube.com/results?search_query=" + Uri.encode(u);
             }
             loadBoth(u);
         });
@@ -214,7 +214,7 @@ final class BrowserEngine {
     private void dispatchTap(WebView view, float x, float y) {
         long t = android.os.SystemClock.uptimeMillis();
         MotionEvent down = MotionEvent.obtain(t, t, MotionEvent.ACTION_DOWN, x, y, 0);
-        MotionEvent up = MotionEvent.obtain(t, t + 95, MotionEvent.ACTION_UP, x, y, 0);
+        MotionEvent up = MotionEvent.obtain(t, t + 90, MotionEvent.ACTION_UP, x, y, 0);
         view.dispatchTouchEvent(down);
         view.dispatchTouchEvent(up);
         down.recycle();
@@ -288,7 +288,7 @@ final class BrowserEngine {
         @Override public void run() {
             if (!running) return;
             syncMirrorState();
-            handler.postDelayed(this, 400);
+            handler.postDelayed(this, 450);
         }
     };
 
