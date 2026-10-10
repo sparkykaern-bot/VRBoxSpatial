@@ -47,6 +47,7 @@ public class MainActivity extends Activity implements
     private android.opengl.GLSurfaceView glView;
     private ArStereoRenderer renderer;
     private SpatialOverlayView overlay;
+    private LensMaskView lensMask;
     private BrowserEngine browser;
     private HandTracker handTracker;
     private Session arSession;
@@ -56,6 +57,7 @@ public class MainActivity extends Activity implements
     private boolean anchorsReady;
     private String cameraStatus = "Câmera AR: automática";
     private Pose lastStablePose = Pose.IDENTITY;
+    private final HeadPoseStabilizer headPoseStabilizer = new HeadPoseStabilizer();
 
     private final Object windowLock = new Object();
     private final List<SpatialWindow> windows = new ArrayList<>();
@@ -101,6 +103,14 @@ public class MainActivity extends Activity implements
 
         overlay = new SpatialOverlayView(this, this, browser);
         root.addView(overlay, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT));
+
+        // Final compositor layer: both the passthrough and every spatial panel are seen through
+        // the same shaped per-eye optical opening, so the result no longer feels like two flat
+        // rectangular camera feeds glued side-by-side.
+        lensMask = new LensMaskView(this);
+        root.addView(lensMask, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT));
 
@@ -201,6 +211,7 @@ public class MainActivity extends Activity implements
             cfg.setFocusMode(Config.FocusMode.AUTO);
             cfg.setUpdateMode(Config.UpdateMode.LATEST_CAMERA_IMAGE);
             arSession.configure(cfg);
+            headPoseStabilizer.reset();
 
             if (overlay != null) {
                 overlay.setCameraStatus(cameraStatus);
@@ -291,8 +302,13 @@ public class MainActivity extends Activity implements
     @Override public void onArFrame(Frame frame, Camera camera, int width, int height) {
         boolean tracking = camera.getTrackingState() == TrackingState.TRACKING;
         Pose measuredPose = camera.getDisplayOrientedPose();
-        if (tracking) lastStablePose = measuredPose;
-        Pose displayPose = tracking ? measuredPose : lastStablePose;
+
+        // Two-stage stability: this filter rejects slow ARCore map drift before the overlay's own
+        // screen-space dead zone sees it. Actual head movement unlocks after two consecutive frames.
+        Pose displayPose = headPoseStabilizer.update(measuredPose, tracking);
+        if (tracking) lastStablePose = displayPose;
+        else displayPose = lastStablePose;
+
         if (tracking && !anchorsReady) createDefaultAnchors(displayPose);
 
         float[] projection = new float[16];
@@ -304,6 +320,7 @@ public class MainActivity extends Activity implements
         } catch (Throwable ignored) { }
         final float px = projX;
         final float py = projY;
+        final Pose stableDisplayPose = displayPose;
 
         if (rawHandVisible && rawHandW > 0 && rawHandH > 0) {
             float[] in = {rawHandX * rawHandW, rawHandY * rawHandH};
@@ -315,7 +332,7 @@ public class MainActivity extends Activity implements
                 float conf = rawHandConfidence;
                 runOnUiThread(() -> {
                     overlay.setProjectionScales(px, py);
-                    overlay.updateCameraPose(displayPose, tracking);
+                    overlay.updateCameraPose(stableDisplayPose, tracking);
                     overlay.setCameraStatus(cameraStatus);
                     overlay.setOpticsStatus(renderer.opticsStatus());
                     overlay.setHand(out[0], out[1], hp, ho, conf);
@@ -323,13 +340,13 @@ public class MainActivity extends Activity implements
             } catch (Throwable t) {
                 runOnUiThread(() -> {
                     overlay.setProjectionScales(px, py);
-                    overlay.updateCameraPose(displayPose, tracking);
+                    overlay.updateCameraPose(stableDisplayPose, tracking);
                 });
             }
         } else {
             runOnUiThread(() -> {
                 overlay.setProjectionScales(px, py);
-                overlay.updateCameraPose(displayPose, tracking);
+                overlay.updateCameraPose(stableDisplayPose, tracking);
                 overlay.setCameraStatus(cameraStatus);
                 overlay.setOpticsStatus(renderer.opticsStatus());
                 overlay.clearHand();
@@ -367,6 +384,7 @@ public class MainActivity extends Activity implements
     private void setAnchor(SpatialWindow w, Pose pose) {
         if (w.anchor != null) w.anchor.detach();
         w.anchor = arSession.createAnchor(pose);
+        w.lockToCurrentAnchor();
     }
 
     @Override public void onHand(float imageX, float imageY, int imageWidth, int imageHeight,
@@ -404,6 +422,7 @@ public class MainActivity extends Activity implements
                 if (window.anchor != null) window.anchor.detach();
                 window.anchor = arSession.createAnchor(new Pose(world, pose.getRotationQuaternion()));
                 window.depthMeters = depth;
+                window.lockToCurrentAnchor();
             }
             runOnUiThread(overlay::invalidate);
         });
@@ -431,6 +450,7 @@ public class MainActivity extends Activity implements
                         SpatialWindow.Kind.BROWSER, .72f, .43f, 1.10f);
                 Pose wp = pose.compose(Pose.makeTranslation(.28f, -.14f, -1.10f));
                 w.anchor = arSession.createAnchor(wp);
+                w.lockToCurrentAnchor();
                 windows.add(w);
             }
             runOnUiThread(() -> overlay.setWindows(windows));
