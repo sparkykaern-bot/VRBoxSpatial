@@ -1,0 +1,75 @@
+name: Build Aperture Hand Pinch
+
+on:
+  push:
+    branches: [ "aperture-handpinch" ]
+    paths:
+      - "aperture-handpinch/**"
+      - ".github/workflows/build-aperture-handpinch.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout personal patch host
+        uses: actions/checkout@v4
+        with:
+          ref: aperture-handpinch
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle 8.13
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.13"
+
+      - name: Clone Aperture Reality v0.4.0-beta
+        run: |
+          git clone --depth 1 --branch v0.4.0-beta --recurse-submodules \
+            https://github.com/xxDMONxx/aperture-reality.git aperture
+          git -C aperture submodule update --init --recursive
+
+      - name: Apply hand-pinch layer
+        run: |
+          python3 aperture-handpinch/apply_patch.py \
+            aperture aperture-handpinch/HandPinchTracker.java
+
+      - name: Fetch MediaPipe hand model
+        run: |
+          mkdir -p aperture/app/src/main/assets
+          curl -L --fail --retry 3 \
+            "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task" \
+            -o aperture/app/src/main/assets/hand_landmarker.task
+          test -s aperture/app/src/main/assets/hand_landmarker.task
+
+      - name: Build Universal 3DoF arm64 debug APK
+        working-directory: aperture
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleUniversal3dofArm64GeckoGenericDebug --stacktrace
+
+      - name: Collect APK
+        run: |
+          find aperture/app/build/outputs/apk -type f -name '*.apk' -print
+          APK="$(find aperture/app/build/outputs/apk -type f -name '*.apk' | head -n 1)"
+          test -n "$APK"
+          cp "$APK" ApertureReality-v0.4.0-beta-HandPinch-debug.apk
+          test -s ApertureReality-v0.4.0-beta-HandPinch-debug.apk
+
+      - name: Upload personal test APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ApertureReality-v0.4.0-beta-HandPinch-debug
+          path: ApertureReality-v0.4.0-beta-HandPinch-debug.apk
+          if-no-files-found: error
+          retention-days: 1
