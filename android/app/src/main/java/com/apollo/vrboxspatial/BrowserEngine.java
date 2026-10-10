@@ -20,11 +20,12 @@ import android.widget.FrameLayout;
 final class BrowserEngine {
     interface Listener { void onTitleChanged(String title); }
 
-    private static final String HOME = "https://m.youtube.com/";
-    // Keep a fixed internal browser resolution. Resizing a WebView every AR frame makes responsive
-    // sites (especially YouTube) continuously reflow/zoom and invalidates touch coordinates.
-    private static final int LOGICAL_W = 1080;
-    private static final int LOGICAL_H = 720;
+    private static final String HOME = "https://www.youtube.com/";
+    private static final int LOGICAL_W = 1280;
+    private static final int LOGICAL_H = 768;
+    private static final String DESKTOP_UA =
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 
     private final Activity activity;
     private final Listener listener;
@@ -34,8 +35,6 @@ final class BrowserEngine {
 
     private boolean running = true;
     private String currentUrl = HOME;
-    private RectF leftViewport = new RectF();
-    private RectF rightViewport = new RectF();
 
     BrowserEngine(Activity activity, FrameLayout root, Listener listener) {
         this.activity = activity;
@@ -43,10 +42,8 @@ final class BrowserEngine {
 
         left = createWebView(false);
         right = createWebView(true);
-
-        FrameLayout.LayoutParams fixed = new FrameLayout.LayoutParams(LOGICAL_W, LOGICAL_H);
-        root.addView(left, new FrameLayout.LayoutParams(fixed));
-        root.addView(right, new FrameLayout.LayoutParams(fixed));
+        root.addView(left, new FrameLayout.LayoutParams(LOGICAL_W, LOGICAL_H));
+        root.addView(right, new FrameLayout.LayoutParams(LOGICAL_W, LOGICAL_H));
         left.setVisibility(View.GONE);
         right.setVisibility(View.GONE);
 
@@ -65,26 +62,22 @@ final class BrowserEngine {
         s.setDisplayZoomControls(false);
         s.setSupportZoom(false);
         s.setUseWideViewPort(true);
-        s.setLoadWithOverviewMode(false);
+        s.setLoadWithOverviewMode(true);
         s.setLayoutAlgorithm(WebSettings.LayoutAlgorithm.NORMAL);
-        s.setTextZoom(100);
+        s.setTextZoom(90);
+        s.setDefaultFontSize(14);
         s.setSupportMultipleWindows(false);
         s.setJavaScriptCanOpenWindowsAutomatically(true);
         s.setLoadsImagesAutomatically(true);
         s.setCacheMode(WebSettings.LOAD_DEFAULT);
         s.setAllowContentAccess(true);
         s.setAllowFileAccess(false);
-
-        String ua = WebSettings.getDefaultUserAgent(activity);
-        if (ua != null) {
-            ua = ua.replace("; wv", "");
-            s.setUserAgentString(ua);
-        }
+        s.setUserAgentString(DESKTOP_UA);
 
         CookieManager.getInstance().setAcceptCookie(true);
         CookieManager.getInstance().setAcceptThirdPartyCookies(w, true);
 
-        w.setInitialScale(100);
+        w.setInitialScale(0);
         w.setBackgroundColor(Color.BLACK);
         w.setLayerType(View.LAYER_TYPE_HARDWARE, null);
         w.setOverScrollMode(View.OVER_SCROLL_NEVER);
@@ -93,8 +86,6 @@ final class BrowserEngine {
         w.setPivotX(0f);
         w.setPivotY(0f);
         if (mirrorEye) {
-            // The right view is visual-only. All actions are performed once on the left and then
-            // mirrored, avoiding double navigation/subscription clicks and inconsistent states.
             w.setClickable(false);
             w.setFocusable(false);
         }
@@ -112,7 +103,9 @@ final class BrowserEngine {
             }
 
             @Override public void onPageFinished(WebView view, String url) {
+                tunePage(view);
                 if (mirrorEye) muteMirror();
+                else handler.postDelayed(BrowserEngine.this::syncMirrorState, 220);
             }
         });
 
@@ -126,14 +119,25 @@ final class BrowserEngine {
         return w;
     }
 
+    private void tunePage(WebView view) {
+        try {
+            String js = "(function(){" +
+                    "var m=document.querySelector('meta[name=viewport]');" +
+                    "if(!m){m=document.createElement('meta');m.name='viewport';document.head.appendChild(m);}" +
+                    "m.setAttribute('content','width=1280,initial-scale=1,maximum-scale=1,user-scalable=no');" +
+                    "document.documentElement.style.background='#000';" +
+                    "if(document.body)document.body.style.background='#000';" +
+                    "})();";
+            view.evaluateJavascript(js, null);
+        } catch (Throwable ignored) { }
+    }
+
     void setViewport(RectF leftRect, RectF rightRect, boolean visible) {
         if (!running) return;
         if (!visible || leftRect == null || rightRect == null || leftRect.width() < 40 || rightRect.width() < 40) {
             hide();
             return;
         }
-        leftViewport.set(leftRect);
-        rightViewport.set(rightRect);
         applyTransform(left, leftRect);
         applyTransform(right, rightRect);
     }
@@ -141,7 +145,6 @@ final class BrowserEngine {
     private void applyTransform(WebView view, RectF r) {
         float sx = Math.max(.05f, r.width() / LOGICAL_W);
         float sy = Math.max(.05f, r.height() / LOGICAL_H);
-        // Fixed layout size + transform = stable CSS viewport and stable video surface.
         view.setScaleX(sx);
         view.setScaleY(sy);
         view.setX(r.left);
@@ -160,7 +163,7 @@ final class BrowserEngine {
             if (u.isEmpty()) return;
             if (!u.startsWith("http://") && !u.startsWith("https://")) {
                 if (u.contains(".") && !u.contains(" ")) u = "https://" + u;
-                else u = "https://m.youtube.com/results?search_query=" + Uri.encode(u);
+                else u = "https://www.youtube.com/results?search_query=" + Uri.encode(u);
             }
             loadBoth(u);
         });
@@ -204,14 +207,14 @@ final class BrowserEngine {
         activity.runOnUiThread(() -> {
             dispatchTap(left, x, y);
             handler.postDelayed(this::syncMirrorUrl, 220);
-            handler.postDelayed(this::syncMirrorState, 300);
+            handler.postDelayed(this::syncMirrorState, 330);
         });
     }
 
     private void dispatchTap(WebView view, float x, float y) {
         long t = android.os.SystemClock.uptimeMillis();
         MotionEvent down = MotionEvent.obtain(t, t, MotionEvent.ACTION_DOWN, x, y, 0);
-        MotionEvent up = MotionEvent.obtain(t, t + 70, MotionEvent.ACTION_UP, x, y, 0);
+        MotionEvent up = MotionEvent.obtain(t, t + 95, MotionEvent.ACTION_UP, x, y, 0);
         view.dispatchTouchEvent(down);
         view.dispatchTouchEvent(up);
         down.recycle();
@@ -225,20 +228,20 @@ final class BrowserEngine {
         final float y1 = clamp01(toNy) * LOGICAL_H;
         activity.runOnUiThread(() -> {
             dispatchDrag(left, x0, y0, x1, y1);
-            handler.postDelayed(this::syncScroll, 80);
-            handler.postDelayed(this::syncMirrorState, 160);
+            handler.postDelayed(this::syncScroll, 100);
+            handler.postDelayed(this::syncMirrorState, 180);
         });
     }
 
     private void dispatchDrag(WebView view, float x0, float y0, float x1, float y1) {
         long t = android.os.SystemClock.uptimeMillis();
         MotionEvent down = MotionEvent.obtain(t, t, MotionEvent.ACTION_DOWN, x0, y0, 0);
-        MotionEvent move1 = MotionEvent.obtain(t, t + 45, MotionEvent.ACTION_MOVE,
-                x0 + (x1-x0)*.35f, y0 + (y1-y0)*.35f, 0);
-        MotionEvent move2 = MotionEvent.obtain(t, t + 85, MotionEvent.ACTION_MOVE,
-                x0 + (x1-x0)*.72f, y0 + (y1-y0)*.72f, 0);
-        MotionEvent move3 = MotionEvent.obtain(t, t + 120, MotionEvent.ACTION_MOVE, x1, y1, 0);
-        MotionEvent up = MotionEvent.obtain(t, t + 150, MotionEvent.ACTION_UP, x1, y1, 0);
+        MotionEvent move1 = MotionEvent.obtain(t, t + 50, MotionEvent.ACTION_MOVE,
+                x0 + (x1-x0)*.30f, y0 + (y1-y0)*.30f, 0);
+        MotionEvent move2 = MotionEvent.obtain(t, t + 95, MotionEvent.ACTION_MOVE,
+                x0 + (x1-x0)*.68f, y0 + (y1-y0)*.68f, 0);
+        MotionEvent move3 = MotionEvent.obtain(t, t + 140, MotionEvent.ACTION_MOVE, x1, y1, 0);
+        MotionEvent up = MotionEvent.obtain(t, t + 180, MotionEvent.ACTION_UP, x1, y1, 0);
         view.dispatchTouchEvent(down);
         view.dispatchTouchEvent(move1);
         view.dispatchTouchEvent(move2);
@@ -271,7 +274,7 @@ final class BrowserEngine {
                             boolean paused = "1".equals(parts[1]);
                             double rate = Double.parseDouble(parts[2]);
                             String js = "(function(){var v=document.querySelector('video');if(!v)return;" +
-                                    "if(Math.abs((v.currentTime||0)-" + t + ")>.30)v.currentTime=" + t + ";" +
+                                    "if(Math.abs((v.currentTime||0)-" + t + ")>.25)v.currentTime=" + t + ";" +
                                     "v.playbackRate=" + rate + ";v.muted=true;" +
                                     (paused ? "v.pause();" : "v.play().catch(function(){});") +
                                     "})()";
@@ -285,7 +288,7 @@ final class BrowserEngine {
         @Override public void run() {
             if (!running) return;
             syncMirrorState();
-            handler.postDelayed(this, 450);
+            handler.postDelayed(this, 400);
         }
     };
 
