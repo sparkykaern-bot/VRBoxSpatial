@@ -51,6 +51,7 @@ jobs:
         run: |
           python3 aperture-handpinch/apply_patch.py \
             aperture aperture-handpinch/HandPinchTracker.java
+          python3 aperture-handpinch/runtime_fix_v2.py aperture
 
       - name: Fetch MediaPipe hand model
         run: |
@@ -71,13 +72,13 @@ jobs:
           find aperture/app/build/outputs/apk -type f -name '*.apk' -print
           APK="$(find aperture/app/build/outputs/apk -type f -name '*.apk' | head -n 1)"
           test -n "$APK"
-          cp "$APK" ApertureReality-v0.4.0-beta-HandPinch-debug.apk
-          test -s ApertureReality-v0.4.0-beta-HandPinch-debug.apk
+          cp "$APK" ApertureReality-v0.4.0-beta-HandPinch-v2-debug.apk
+          test -s ApertureReality-v0.4.0-beta-HandPinch-v2-debug.apk
 
       - name: Upload personal test APK
         uses: actions/upload-artifact@v4
         with:
-          name: ApertureReality-v0.4.0-beta-HandPinch-debug
-          path: ApertureReality-v0.4.0-beta-HandPinch-debug.apk
+          name: ApertureReality-v0.4.0-beta-HandPinch-v2-debug
+          path: ApertureReality-v0.4.0-beta-HandPinch-v2-debug.apk
           if-no-files-found: error
           retention-days: 1
