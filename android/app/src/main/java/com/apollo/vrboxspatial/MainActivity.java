@@ -122,24 +122,24 @@ public class MainActivity extends Activity implements
 
             SpatialWindow main = new SpatialWindow(
                     "browser-main", "YouTube / Navegador", SpatialWindow.Kind.BROWSER,
-                    .82f, .48f, 1.04f);
+                    .84f, .49f, 1.06f);
             windows.add(main);
 
             SpatialWindow media = new SpatialWindow(
                     "media", "YouTube", SpatialWindow.Kind.MEDIA,
-                    .54f, .32f, 1.12f);
+                    .54f, .32f, 1.14f);
             media.visible = false;
             windows.add(media);
 
             SpatialWindow notes = new SpatialWindow(
                     "notes", "Notas", SpatialWindow.Kind.NOTES,
-                    .52f, .34f, 1.12f);
+                    .52f, .34f, 1.14f);
             notes.visible = false;
             windows.add(notes);
 
             SpatialWindow system = new SpatialWindow(
                     "system", "Sistema", SpatialWindow.Kind.SYSTEM,
-                    .54f, .34f, 1.12f);
+                    .54f, .34f, 1.14f);
             system.visible = false;
             windows.add(system);
         }
@@ -295,6 +295,16 @@ public class MainActivity extends Activity implements
         Pose displayPose = tracking ? measuredPose : lastStablePose;
         if (tracking && !anchorsReady) createDefaultAnchors(displayPose);
 
+        float[] projection = new float[16];
+        float projX = 1f, projY = 1f;
+        try {
+            camera.getProjectionMatrix(projection, 0, .05f, 20f);
+            projX = Math.max(.25f, Math.abs(projection[0]));
+            projY = Math.max(.25f, Math.abs(projection[5]));
+        } catch (Throwable ignored) { }
+        final float px = projX;
+        final float py = projY;
+
         if (rawHandVisible && rawHandW > 0 && rawHandH > 0) {
             float[] in = {rawHandX * rawHandW, rawHandY * rawHandH};
             float[] out = new float[2];
@@ -304,16 +314,21 @@ public class MainActivity extends Activity implements
                 boolean ho = rawHandOpen;
                 float conf = rawHandConfidence;
                 runOnUiThread(() -> {
+                    overlay.setProjectionScales(px, py);
                     overlay.updateCameraPose(displayPose, tracking);
                     overlay.setCameraStatus(cameraStatus);
                     overlay.setOpticsStatus(renderer.opticsStatus());
                     overlay.setHand(out[0], out[1], hp, ho, conf);
                 });
             } catch (Throwable t) {
-                runOnUiThread(() -> overlay.updateCameraPose(displayPose, tracking));
+                runOnUiThread(() -> {
+                    overlay.setProjectionScales(px, py);
+                    overlay.updateCameraPose(displayPose, tracking);
+                });
             }
         } else {
             runOnUiThread(() -> {
+                overlay.setProjectionScales(px, py);
                 overlay.updateCameraPose(displayPose, tracking);
                 overlay.setCameraStatus(cameraStatus);
                 overlay.setOpticsStatus(renderer.opticsStatus());
@@ -340,10 +355,10 @@ public class MainActivity extends Activity implements
         if (arSession == null) return;
         synchronized (windowLock) {
             if (windows.size() < 4) return;
-            setAnchor(windows.get(0), pose.compose(Pose.makeTranslation(0f, -.01f, -1.04f)));
-            setAnchor(windows.get(1), pose.compose(Pose.makeTranslation(.58f, .03f, -1.12f)));
-            setAnchor(windows.get(2), pose.compose(Pose.makeTranslation(-.58f, .22f, -1.12f)));
-            setAnchor(windows.get(3), pose.compose(Pose.makeTranslation(.58f, .22f, -1.12f)));
+            setAnchor(windows.get(0), pose.compose(Pose.makeTranslation(0f, -.01f, -1.06f)));
+            setAnchor(windows.get(1), pose.compose(Pose.makeTranslation(.58f, .03f, -1.14f)));
+            setAnchor(windows.get(2), pose.compose(Pose.makeTranslation(-.58f, .22f, -1.14f)));
+            setAnchor(windows.get(3), pose.compose(Pose.makeTranslation(.58f, .22f, -1.14f)));
             anchorsReady = true;
         }
         runOnUiThread(() -> overlay.setWindows(windows));
@@ -351,7 +366,7 @@ public class MainActivity extends Activity implements
 
     private void setAnchor(SpatialWindow w, Pose pose) {
         if (w.anchor != null) w.anchor.detach();
-        w.anchor = arSession.createAnchor(Pose.makeTranslation(pose.tx(), pose.ty(), pose.tz()));
+        w.anchor = arSession.createAnchor(pose);
     }
 
     @Override public void onHand(float imageX, float imageY, int imageWidth, int imageHeight,
@@ -373,21 +388,21 @@ public class MainActivity extends Activity implements
 
     @Override public void moveWindowToScreen(SpatialWindow window, float nx, float ny) {
         if (glView == null || arSession == null || overlay == null || window == null) return;
-        final float safeX = clamp(nx, .18f, .82f);
-        final float safeY = clamp(ny, .18f, .76f);
+        final float safeX = clamp(nx, .14f, .86f);
+        final float safeY = clamp(ny, .14f, .82f);
         final float[] ray = overlay.screenRay(safeX, safeY);
         final float depth = overlay.depthFor(window);
         final Pose pose = overlay.cameraPose();
 
         glView.queueEvent(() -> {
-            float rayZ = Math.max(.24f, -ray[2]);
+            float rayZ = Math.max(.22f, -ray[2]);
             float scale = depth / rayZ;
-            float localX = clamp(ray[0] * scale, -depth*.56f, depth*.56f);
-            float localY = clamp(ray[1] * scale, -depth*.34f, depth*.34f);
+            float localX = clamp(ray[0] * scale, -depth*.62f, depth*.62f);
+            float localY = clamp(ray[1] * scale, -depth*.40f, depth*.40f);
             float[] world = pose.transformPoint(new float[]{localX, localY, -depth});
             synchronized (windowLock) {
                 if (window.anchor != null) window.anchor.detach();
-                window.anchor = arSession.createAnchor(Pose.makeTranslation(world[0], world[1], world[2]));
+                window.anchor = arSession.createAnchor(new Pose(world, pose.getRotationQuaternion()));
                 window.depthMeters = depth;
             }
             runOnUiThread(overlay::invalidate);
@@ -400,9 +415,7 @@ public class MainActivity extends Activity implements
         glView.queueEvent(() -> {
             anchorsReady = false;
             synchronized (windowLock) {
-                for (int i = 0; i < windows.size(); i++) {
-                    windows.get(i).visible = (i == 0);
-                }
+                for (int i = 0; i < windows.size(); i++) windows.get(i).visible = (i == 0);
             }
             createDefaultAnchors(pose);
         });
@@ -415,9 +428,9 @@ public class MainActivity extends Activity implements
             SpatialWindow w;
             synchronized (windowLock) {
                 w = new SpatialWindow("browser-" + System.currentTimeMillis(), "Navegador",
-                        SpatialWindow.Kind.BROWSER, .72f, .43f, 1.08f);
-                Pose wp = pose.compose(Pose.makeTranslation(.28f, -.14f, -1.08f));
-                w.anchor = arSession.createAnchor(Pose.makeTranslation(wp.tx(), wp.ty(), wp.tz()));
+                        SpatialWindow.Kind.BROWSER, .72f, .43f, 1.10f);
+                Pose wp = pose.compose(Pose.makeTranslation(.28f, -.14f, -1.10f));
+                w.anchor = arSession.createAnchor(wp);
                 windows.add(w);
             }
             runOnUiThread(() -> overlay.setWindows(windows));
