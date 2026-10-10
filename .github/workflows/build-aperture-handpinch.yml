@@ -39,6 +39,14 @@ jobs:
             https://github.com/xxDMONxx/aperture-reality.git aperture
           git -C aperture submodule update --init --recursive
 
+      - name: Restore public Wolvic OpenWnn dependency
+        run: |
+          mkdir -p aperture/libs/openwnn
+          curl -L --fail --retry 3 \
+            "https://raw.githubusercontent.com/Igalia/wolvic/main/libs/openwnn/openwnn-1.3.7.aar" \
+            -o aperture/libs/openwnn/openwnn-1.3.7.aar
+          test -s aperture/libs/openwnn/openwnn-1.3.7.aar
+
       - name: Apply hand-pinch layer
         run: |
           python3 aperture-handpinch/apply_patch.py \
