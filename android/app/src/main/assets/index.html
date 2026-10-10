@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover" />
+<title>VR Box Spatial</title>
+<style>
+  html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#000;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;touch-action:none}
+  #cam{position:fixed;left:-9999px;top:-9999px;width:2px;height:2px;opacity:0}
+  #xr{position:fixed;inset:0;width:100%;height:100%;background:#000}
+  #hud{position:fixed;left:50%;top:10px;transform:translateX(-50%);display:flex;gap:8px;z-index:10;opacity:.92}
+  button,.pill{border:1px solid #ffffff44;background:#111c;color:#fff;border-radius:12px;padding:9px 12px;backdrop-filter:blur(10px);font-size:13px}
+  button{cursor:pointer}
+  #startPanel{position:fixed;z-index:20;inset:0;display:grid;place-items:center;background:radial-gradient(circle at center,#15202dcc,#05070acc)}
+  #card{width:min(520px,88vw);padding:22px;border:1px solid #ffffff22;border-radius:22px;background:#10151eea;color:white;box-shadow:0 20px 80px #0008}
+  #card h1{font-size:24px;margin:0 0 10px}
+  #card p{color:#cbd5e1;line-height:1.45;margin:8px 0}
+  #card button{font-size:16px;padding:12px 18px;margin-top:10px;background:#ffffff1c}
+  #status{font-size:12px;color:#dbeafe;margin-top:10px;min-height:18px}
+  #settings{position:fixed;right:10px;bottom:10px;z-index:12;width:min(300px,42vw);padding:10px;border:1px solid #ffffff33;border-radius:14px;background:#0b1018dd;color:white;font-size:12px;display:none}
+  #settings label{display:grid;grid-template-columns:90px 1fr 42px;gap:8px;align-items:center;margin:7px 0}
+  #settings input[type=range]{width:100%}
+  .check{display:flex!important;grid-template-columns:none!important;gap:8px!important}
+  #hint{position:fixed;bottom:8px;left:50%;transform:translateX(-50%);z-index:8;color:#fff9;font-size:11px;text-shadow:0 1px 3px #000;text-align:center;pointer-events:none}
+  @media (max-height:450px){#hud{top:4px}.pill,button{padding:6px 9px}#hint{display:none}}
+</style>
+</head>
+<body>
+<video id="cam" playsinline autoplay muted></video>
+<canvas id="xr"></canvas>
+
+<div id="hud" style="display:none">
+  <button id="recenter">Recentrar</button>
+  <button id="settingsBtn">Ajustes</button>
+  <span class="pill" id="handState">Mão: iniciando…</span>
+</div>
+<div id="settings">
+  <label><span>FOV</span><input id="fov" type="range" min="55" max="110" value="82"><b id="fovV">82</b></label>
+  <label><span>Paralaxe</span><input id="ipd" type="range" min="0" max="40" value="14"><b id="ipdV">14</b></label>
+  <label><span>Escala UI</span><input id="uiScale" type="range" min="70" max="135" value="100"><b id="uiScaleV">100</b></label>
+  <label class="check"><input id="mirrorHand" type="checkbox"><span>Espelhar cursor da mão</span></label>
+  <label class="check"><input id="showHands" type="checkbox" checked><span>Mostrar cursor</span></label>
+</div>
+<div id="hint">Junte polegar + indicador sobre uma janela para segurar e arrastar.</div>
+
+<div id="startPanel">
+  <div id="card">
+    <h1>VR Box Spatial — protótipo</h1>
+    <p>Mostra a câmera traseira como passthrough, duplica a cena para os dois olhos e mantém janelas virtuais no espaço enquanto você mexe a cabeça.</p>
+    <p>O rastreamento de mão usa MediaPipe. Funciona melhor com boa iluminação e com a câmera traseira do celular desobstruída pelo VR Box.</p>
+    <button id="start">Iniciar câmera + VR</button>
+    <div id="status">Pronto para iniciar.</div>
+  </div>
+</div>
+
+<script>
+(() => {
+'use strict';
+const canvas = document.getElementById('xr');
+const ctx = canvas.getContext('2d', { alpha:false, desynchronized:true });
+const video = document.getElementById('cam');
+const startPanel = document.getElementById('startPanel');
+const statusEl = document.getElementById('status');
+const hud = document.getElementById('hud');
+const handState = document.getElementById('handState');
+const settings = document.getElementById('settings');
+
+const state = {
+  running:false,
+  rawYaw:0, rawPitch:0, rawRoll:0,
+  baseYaw:0, basePitch:0,
+  yaw:0, pitch:0,
+  fov:82, parallax:14, uiScale:1,
+  mirrorHand:false, showHands:true,
+  hand:{visible:false,x:.5,y:.5,pinch:false,prevPinch:false,score:0},
+  dragging:null,
+  handTracker:null,
+  handLastTs:0,
+  handBusy:false,
+  fps:0, frames:0, fpsTs:performance.now(),
+};
+
+const windows = [
+  {id:'browser', title:'NAVEGADOR', yaw:-19, pitch:-5, z:1.15, w:380, h:245, kind:'browser'},
+  {id:'media', title:'MÍDIA', yaw:17, pitch:-3, z:1.0, w:350, h:220, kind:'media'},
+  {id:'system', title:'SISTEMA', yaw:0, pitch:15, z:1.35, w:300, h:175, kind:'system'}
+];
+
+function resize(){
+  const dpr=Math.min(devicePixelRatio||1,2);
+  canvas.width=Math.floor(innerWidth*dpr);
+  canvas.height=Math.floor(innerHeight*dpr);
+  canvas.style.width=innerWidth+'px'; canvas.style.height=innerHeight+'px';
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+}
+addEventListener('resize', resize); resize();
+
+function normAngle(a){ while(a>180)a-=360; while(a<-180)a+=360; return a; }
+function recenter(){ state.baseYaw=state.rawYaw; state.basePitch=state.rawPitch; }
+window.__nativePose=(yaw,pitch,roll)=>{
+  state.rawYaw=+yaw||0; state.rawPitch=+pitch||0; state.rawRoll=+roll||0;
+};
+
+addEventListener('deviceorientation',(e)=>{
+  if (typeof e.alpha==='number' && performance.now()-window.__lastNativePoseTs>250){
+    state.rawYaw=e.alpha||0; state.rawPitch=e.beta||0; state.rawRoll=e.gamma||0;
+  }
+});
+window.__nativePose=(yaw,pitch,roll)=>{ window.__lastNativePoseTs=performance.now(); state.rawYaw=+yaw||0; state.rawPitch=+pitch||0; state.rawRoll=+roll||0; };
+window.__lastNativePoseTs=-9999;
+
+async function startCamera(){
+  statusEl.textContent='Abrindo câmera traseira…';
+  const stream=await navigator.mediaDevices.getUserMedia({
+    video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720},frameRate:{ideal:60,max:60}},
+    audio:false
+  });
+  video.srcObject=stream;
+  await video.play();
+  statusEl.textContent=`Câmera OK (${video.videoWidth}×${video.videoHeight}).`;
+}
+
+async function initHands(){
+  handState.textContent='Mão: carregando…';
+  try{
+    const vision = await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/+esm');
+    const fileset = await vision.FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/wasm');
+    let opts={
+      baseOptions:{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',delegate:'GPU'},
+      runningMode:'VIDEO', numHands:2,
+      minHandDetectionConfidence:.45,minHandPresenceConfidence:.45,minTrackingConfidence:.4
+    };
+    try{ state.handTracker=await vision.HandLandmarker.createFromOptions(fileset,opts); }
+    catch(e){ opts.baseOptions.delegate='CPU'; state.handTracker=await vision.HandLandmarker.createFromOptions(fileset,opts); }
+    handState.textContent='Mão: ativa';
+  }catch(err){
+    console.error(err); handState.textContent='Mão: indisponível';
+    state.handTracker=null;
+  }
+}
+
+function updateHand(now){
+  if(!state.handTracker || state.handBusy || video.readyState<2 || now-state.handLastTs<55) return;
+  state.handBusy=true; state.handLastTs=now;
+  try{
+    const r=state.handTracker.detectForVideo(video,now);
+    const list=r?.landmarks || r?.handLandmarks || [];
+    if(list.length){
+      const lm=list[0], tip=lm[8], thumb=lm[4];
+      let x=tip.x, y=tip.y;
+      if(state.mirrorHand) x=1-x;
+      const d=Math.hypot(tip.x-thumb.x,tip.y-thumb.y);
+      state.hand.visible=true; state.hand.x=x; state.hand.y=y;
+      state.hand.pinch=d<0.058; state.hand.score=Math.max(0,1-d/0.12);
+    }else{ state.hand.visible=false; state.hand.pinch=false; }
+  }catch(e){ console.warn('hand',e); }
+  state.handBusy=false;
+}
+
+function drawCameraEye(x,y,w,h){
+  if(video.readyState<2){ctx.fillStyle='#05070a';ctx.fillRect(x,y,w,h);return;}
+  const vw=video.videoWidth, vh=video.videoHeight;
+  const srcRatio=vw/vh, dstRatio=w/h;
+  let sx=0,sy=0,sw=vw,sh=vh;
+  if(srcRatio>dstRatio){ sw=vh*dstRatio; sx=(vw-sw)/2; }
+  else{ sh=vw/dstRatio; sy=(vh-sh)/2; }
+  ctx.drawImage(video,sx,sy,sw,sh,x,y,w,h);
+  const g=ctx.createRadialGradient(x+w/2,y+h/2,h*.15,x+w/2,y+h/2,h*.75);
+  g.addColorStop(0,'rgba(0,0,0,0)'); g.addColorStop(1,'rgba(0,0,0,.2)');
+  ctx.fillStyle=g; ctx.fillRect(x,y,w,h);
+}
+
+function projection(win, eyeW, H, eyeSign=0){
+  const ppd=eyeW/state.fov;
+  const dyaw=normAngle(win.yaw-state.yaw);
+  const dpitch=win.pitch+state.pitch;
+  const s=state.uiScale/win.z;
+  return {
+    x:eyeW/2+dyaw*ppd + eyeSign*(state.parallax/win.z),
+    y:H/2+dpitch*ppd,
+    w:win.w*s, h:win.h*s, scale:s
+  };
+}
+
+function rr(x,y,w,h,r){
+  r=Math.min(r,w/2,h/2); ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();
+}
+function text(t,x,y,size=14,alpha=1,weight=500){ctx.globalAlpha=alpha;ctx.fillStyle='#fff';ctx.font=`${weight} ${size}px system-ui`;ctx.fillText(t,x,y);ctx.globalAlpha=1}
+
+function drawWindow(win,p,originX,H){
+  const x=originX+p.x-p.w/2,y=p.y-p.h/2;
+  if(x>originX+innerWidth/2+100 || x+p.w<originX-100 || y>H+100 || y+p.h<-100) return;
+  ctx.save();
+  ctx.shadowColor='rgba(0,0,0,.45)';ctx.shadowBlur=24;
+  rr(x,y,p.w,p.h,18*p.scale);ctx.fillStyle='rgba(12,18,28,.87)';ctx.fill();ctx.shadowBlur=0;
+  ctx.strokeStyle='rgba(255,255,255,.22)';ctx.lineWidth=1.2;ctx.stroke();
+  rr(x+1,y+1,p.w-2,36*p.scale,16*p.scale);ctx.fillStyle='rgba(255,255,255,.08)';ctx.fill();
+  text(win.title,x+16*p.scale,y+24*p.scale,12*p.scale,.92,700);
+  ctx.fillStyle='rgba(255,255,255,.35)';ctx.beginPath();ctx.arc(x+p.w-18*p.scale,y+18*p.scale,4*p.scale,0,Math.PI*2);ctx.fill();
+
+  const bx=x+16*p.scale, by=y+56*p.scale;
+  if(win.kind==='browser'){
+    rr(bx,by,p.w-32*p.scale,32*p.scale,10*p.scale);ctx.fillStyle='rgba(255,255,255,.09)';ctx.fill();
+    text('🔎  pesquisar / abrir site',bx+12*p.scale,by+21*p.scale,12*p.scale,.72,500);
+    const items=[['YouTube','Vídeos'],['Wiki','Pesquisa'],['Chat','Web app']];
+    items.forEach((it,i)=>{
+      const yy=by+(47+i*43)*p.scale;rr(bx,yy,p.w-32*p.scale,34*p.scale,9*p.scale);ctx.fillStyle='rgba(255,255,255,.055)';ctx.fill();
+      text(it[0],bx+12*p.scale,yy+22*p.scale,13*p.scale,.95,650);text(it[1],bx+105*p.scale,yy+22*p.scale,11*p.scale,.55,450);
+    });
+  } else if(win.kind==='media'){
+    rr(bx,by,p.w-32*p.scale,100*p.scale,12*p.scale);ctx.fillStyle='rgba(255,255,255,.055)';ctx.fill();
+    text('▶',bx+18*p.scale,by+58*p.scale,30*p.scale,.9,700);
+    text('Janela de mídia',bx+62*p.scale,by+45*p.scale,16*p.scale,.95,700);
+    text('painel espacial',bx+62*p.scale,by+68*p.scale,12*p.scale,.55,450);
+    text('00:00',bx,by+128*p.scale,11*p.scale,.55,500);
+    ctx.fillStyle='rgba(255,255,255,.14)';rr(bx+42*p.scale,by+119*p.scale,p.w-115*p.scale,6*p.scale,3);ctx.fill();
+  } else {
+    text(`FPS: ${state.fps}`,bx,by+10*p.scale,13*p.scale,.9,650);
+    text(`Cabeça: ${state.yaw.toFixed(1)}° / ${state.pitch.toFixed(1)}°`,bx,by+38*p.scale,12*p.scale,.7,500);
+    text(`Mão: ${state.hand.visible?'detectada':'—'}`,bx,by+64*p.scale,12*p.scale,.7,500);
+    text('VR Box Spatial MVP',bx,by+96*p.scale,12*p.scale,.48,500);
+  }
+  ctx.restore();
+}
+
+function centerHit(win,eyeW,H){ const p=projection(win,eyeW,H,0); return {x:p.x-p.w/2,y:p.y-p.h/2,w:p.w,h:p.h,p}; }
+function handleInteraction(eyeW,H){
+  const hand=state.hand;
+  if(!hand.visible){hand.prevPinch=hand.pinch=false;state.dragging=null;return;}
+  const cx=hand.x*eyeW, cy=hand.y*H;
+  if(hand.pinch && !hand.prevPinch){
+    for(let i=windows.length-1;i>=0;i--){ const r=centerHit(windows[i],eyeW,H); if(cx>=r.x&&cx<=r.x+r.w&&cy>=r.y&&cy<=r.y+r.h){state.dragging=windows[i].id; break;} }
+  }
+  if(hand.pinch && state.dragging){
+    const win=windows.find(w=>w.id===state.dragging), ppd=eyeW/state.fov;
+    win.yaw=normAngle(state.yaw+(cx-eyeW/2)/ppd);
+    win.pitch=(cy-H/2)/ppd-state.pitch;
+  }
+  if(!hand.pinch && hand.prevPinch) state.dragging=null;
+  hand.prevPinch=hand.pinch;
+}
+
+function drawCursor(originX,eyeW,H,eyeSign){
+  if(!state.hand.visible||!state.showHands)return;
+  const x=originX+state.hand.x*eyeW+eyeSign*2,y=state.hand.y*H;
+  ctx.save();ctx.lineWidth=2;ctx.strokeStyle=state.hand.pinch?'#7dd3fc':'#fff';ctx.fillStyle=state.hand.pinch?'rgba(125,211,252,.45)':'rgba(255,255,255,.22)';
+  ctx.beginPath();ctx.arc(x,y,state.hand.pinch?15:10,0,Math.PI*2);ctx.fill();ctx.stroke();
+  if(state.hand.pinch){ctx.beginPath();ctx.arc(x,y,24,0,Math.PI*2);ctx.strokeStyle='rgba(125,211,252,.5)';ctx.stroke();}
+  ctx.restore();
+}
+
+function render(now){
+  requestAnimationFrame(render);
+  if(!state.running)return;
+  state.yaw=normAngle(state.rawYaw-state.baseYaw);
+  state.pitch=state.rawPitch-state.basePitch;
+  updateHand(now);
+
+  const W=innerWidth,H=innerHeight,eyeW=W/2;
+  ctx.clearRect(0,0,W,H);
+  drawCameraEye(0,0,eyeW,H); drawCameraEye(eyeW,0,eyeW,H);
+  ctx.fillStyle='rgba(0,0,0,.75)';ctx.fillRect(eyeW-1,0,2,H);
+  handleInteraction(eyeW,H);
+  for(const win of windows){ drawWindow(win,projection(win,eyeW,H,-1),0,H); drawWindow(win,projection(win,eyeW,H,+1),eyeW,H); }
+  drawCursor(0,eyeW,H,-1);drawCursor(eyeW,eyeW,H,+1);
+
+  state.frames++; if(now-state.fpsTs>1000){state.fps=Math.round(state.frames*1000/(now-state.fpsTs));state.frames=0;state.fpsTs=now;}
+}
+requestAnimationFrame(render);
+
+document.getElementById('start').onclick=async()=>{
+  try{
+    await startCamera();
+    if(DeviceOrientationEvent?.requestPermission){ try{await DeviceOrientationEvent.requestPermission();}catch{} }
+    state.running=true; recenter(); startPanel.style.display='none';hud.style.display='flex';
+    document.documentElement.requestFullscreen?.().catch(()=>{});
+    initHands();
+  }catch(e){ console.error(e);statusEl.textContent='Não consegui abrir a câmera: '+(e.message||e); }
+};
+document.getElementById('recenter').onclick=recenter;
+document.getElementById('settingsBtn').onclick=()=>settings.style.display=settings.style.display==='block'?'none':'block';
+for(const id of ['fov','ipd','uiScale']) document.getElementById(id).oninput=(e)=>{
+  const v=+e.target.value;document.getElementById(id+'V').textContent=v;
+  if(id==='fov')state.fov=v;if(id==='ipd')state.parallax=v;if(id==='uiScale')state.uiScale=v/100;
+};
+document.getElementById('mirrorHand').onchange=e=>state.mirrorHand=e.target.checked;
+document.getElementById('showHands').onchange=e=>state.showHands=e.target.checked;
+})();
+</script>
+</body>
+</html>
