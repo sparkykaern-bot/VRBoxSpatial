@@ -1,19 +1,17 @@
 package com.apollo.vrboxspatial;
 
 import android.content.Context;
-import android.graphics.Bitmap;
 import android.media.Image;
 import android.os.SystemClock;
 import android.util.Log;
 
-import com.google.mediapipe.framework.image.BitmapImageBuilder;
 import com.google.mediapipe.framework.image.MPImage;
+import com.google.mediapipe.framework.image.MediaImageBuilder;
 import com.google.mediapipe.tasks.core.BaseOptions;
 import com.google.mediapipe.tasks.vision.core.RunningMode;
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker;
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult;
 
-import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -28,27 +26,31 @@ final class HandTracker {
     }
 
     private static final String TAG = "HandTracker";
-    private static final int OUT_W = 384;
-    private static final int OUT_H = 288;
-    private static final long MIN_FRAME_MS = 55;
-    private static final long LOST_GRACE_MS = 240;
+    private static final long MIN_FRAME_MS = 32;   // ~30 FPS when inference keeps up.
+    private static final long LOST_GRACE_MS = 160;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final AtomicBoolean busy = new AtomicBoolean(false);
     private final Listener listener;
     private HandLandmarker landmarker;
     private long lastSubmitMs;
+    private long lastTimestampMs;
     private long lastSeenMs;
     private boolean lostNotified = true;
 
     private boolean pinchState;
-    private int pinchTransitionFrames;
+    private int pinchEnterFrames;
+    private int pinchExitFrames;
     private boolean openState;
-    private int openTransitionFrames;
+    private int openFrames;
 
     private boolean pointerReady;
     private float smoothX;
     private float smoothY;
+    private float lastTargetX;
+    private float lastTargetY;
+    private float velocityX;
+    private float velocityY;
 
     HandTracker(Context context, Listener listener) {
         this.listener = listener;
@@ -64,12 +66,12 @@ final class HandTracker {
                     .setBaseOptions(base)
                     .setRunningMode(RunningMode.VIDEO)
                     .setNumHands(1)
-                    .setMinHandDetectionConfidence(0.40f)
-                    .setMinHandPresenceConfidence(0.42f)
-                    .setMinTrackingConfidence(0.38f)
+                    .setMinHandDetectionConfidence(0.35f)
+                    .setMinHandPresenceConfidence(0.36f)
+                    .setMinTrackingConfidence(0.34f)
                     .build();
             landmarker = HandLandmarker.createFromOptions(context, options);
-            listener.onHandStatus("Mão: ativa • gesto estável");
+            listener.onHandStatus("Mão: rápida • ~30 FPS");
         } catch (Throwable t) {
             Log.e(TAG, "MediaPipe init failed", t);
             listener.onHandStatus("Mão: indisponível");
@@ -83,22 +85,30 @@ final class HandTracker {
             return;
         }
         lastSubmitMs = now;
+
         executor.execute(() -> {
+            MPImage mp = null;
             try {
                 int sourceW = image.getWidth();
                 int sourceH = image.getHeight();
-                Bitmap bitmap = yuv420ToBitmap(image, OUT_W, OUT_H);
-                image.close();
-                MPImage mp = new BitmapImageBuilder(bitmap).build();
-                long tsMs = Math.max(1L, timestampNs / 1_000_000L);
+
+                // No YUV -> Bitmap conversion. MediaPipe can wrap the camera Image directly,
+                // which removes the most expensive CPU step from the previous versions.
+                mp = new MediaImageBuilder(image).build();
+                long cameraTs = Math.max(1L, timestampNs / 1_000_000L);
+                long tsMs = Math.max(lastTimestampMs + 1L, cameraTs);
+                lastTimestampMs = tsMs;
+
                 HandLandmarkerResult result = landmarker.detectForVideo(mp, tsMs);
                 parse(result, sourceW, sourceH);
-                bitmap.recycle();
             } catch (Throwable t) {
-                try { image.close(); } catch (Throwable ignored) { }
                 Log.w(TAG, "Hand frame failed", t);
                 handleNoHand();
             } finally {
+                if (mp != null) {
+                    try { mp.close(); } catch (Throwable ignored) { }
+                }
+                try { image.close(); } catch (Throwable ignored) { }
                 busy.set(false);
             }
         });
@@ -109,6 +119,7 @@ final class HandTracker {
             handleNoHand();
             return;
         }
+
         List<com.google.mediapipe.tasks.components.containers.NormalizedLandmark> lm = result.landmarks().get(0);
         if (lm.size() < 21) {
             handleNoHand();
@@ -119,20 +130,34 @@ final class HandTracker {
         lastSeenMs = now;
         lostNotified = false;
 
-        float wristX = lm.get(0).x(), wristY = lm.get(0).y();
-        float palm = Math.max(0.035f, distance(lm, 0, 9));
+        float wristX = lm.get(0).x();
+        float wristY = lm.get(0).y();
+        float palm = Math.max(0.030f, distance(lm, 0, 9));
         float pinchRatio = distance(lm, 4, 8) / palm;
 
-        // Hysteresis: entering a pinch is deliberately harder than remaining pinched.
-        boolean wantsPinch = pinchState ? pinchRatio < 0.58f : pinchRatio < 0.42f;
-        if (wantsPinch != pinchState) {
-            pinchTransitionFrames++;
-            if (pinchTransitionFrames >= 2) {
-                pinchState = wantsPinch;
-                pinchTransitionFrames = 0;
+        // Fast hysteresis: react quickly when fingers touch, but require a clearer separation
+        // before releasing so natural landmark noise cannot flicker the gesture.
+        if (!pinchState) {
+            if (pinchRatio < 0.47f) {
+                pinchEnterFrames++;
+                if (pinchEnterFrames >= 1) {
+                    pinchState = true;
+                    pinchEnterFrames = 0;
+                    pinchExitFrames = 0;
+                }
+            } else {
+                pinchEnterFrames = 0;
             }
         } else {
-            pinchTransitionFrames = 0;
+            if (pinchRatio > 0.64f) {
+                pinchExitFrames++;
+                if (pinchExitFrames >= 2) {
+                    pinchState = false;
+                    pinchExitFrames = 0;
+                }
+            } else {
+                pinchExitFrames = 0;
+            }
         }
 
         int extended = 0;
@@ -140,35 +165,51 @@ final class HandTracker {
         if (fingerExtended(lm, 12, 10, wristX, wristY)) extended++;
         if (fingerExtended(lm, 16, 14, wristX, wristY)) extended++;
         if (fingerExtended(lm, 20, 18, wristX, wristY)) extended++;
-        boolean wantsOpen = !pinchState && extended >= 3 && pinchRatio > 0.62f;
-        if (wantsOpen != openState) {
-            openTransitionFrames++;
-            if (openTransitionFrames >= 2) {
-                openState = wantsOpen;
-                openTransitionFrames = 0;
-            }
+
+        boolean wantsOpen = !pinchState && extended >= 3 && pinchRatio > 0.68f;
+        if (wantsOpen) {
+            openFrames++;
+            if (openFrames >= 2) openState = true;
         } else {
-            openTransitionFrames = 0;
+            openFrames = 0;
+            openState = false;
         }
         if (pinchState) openState = false;
 
-        // Index tip is responsive; mixing a little DIP position removes high-frequency jitter.
-        float targetX = lm.get(8).x() * .78f + lm.get(7).x() * .22f;
-        float targetY = lm.get(8).y() * .78f + lm.get(7).y() * .22f;
+        // Responsive pointer: index tip drives the cursor, DIP contributes a little stability.
+        float targetX = lm.get(8).x() * 0.86f + lm.get(7).x() * 0.14f;
+        float targetY = lm.get(8).y() * 0.86f + lm.get(7).y() * 0.14f;
+
         if (!pointerReady) {
             smoothX = targetX;
             smoothY = targetY;
+            lastTargetX = targetX;
+            lastTargetY = targetY;
+            velocityX = velocityY = 0f;
             pointerReady = true;
         } else {
+            float rawVx = targetX - lastTargetX;
+            float rawVy = targetY - lastTargetY;
+            velocityX = velocityX * 0.55f + rawVx * 0.45f;
+            velocityY = velocityY * 0.55f + rawVy * 0.45f;
+            lastTargetX = targetX;
+            lastTargetY = targetY;
+
             float motion = (float)Math.hypot(targetX - smoothX, targetY - smoothY);
-            float alpha = clamp(0.18f + motion * 5.0f, 0.18f, 0.58f);
-            if (pinchState) alpha = Math.min(alpha, 0.30f);
-            if (openState) alpha = Math.min(alpha, 0.24f);
-            smoothX += (targetX - smoothX) * alpha;
-            smoothY += (targetY - smoothY) * alpha;
+            float alpha = clamp(0.48f + motion * 5.5f, 0.48f, 0.86f);
+            if (pinchState) alpha = clamp(alpha, 0.44f, 0.68f);
+            if (openState) alpha = clamp(alpha, 0.40f, 0.62f);
+
+            // Tiny prediction reduces perceived cursor latency without letting fast movements
+            // overshoot dramatically.
+            float predict = pinchState ? 0.20f : 0.30f;
+            float predictedX = targetX + velocityX * predict;
+            float predictedY = targetY + velocityY * predict;
+            smoothX += (predictedX - smoothX) * alpha;
+            smoothY += (predictedY - smoothY) * alpha;
         }
 
-        float confidence = clamp(1f - Math.abs(pinchRatio - (pinchState ? .30f : .85f)) * .35f, .45f, 1f);
+        float confidence = clamp(1f - Math.abs(pinchRatio - (pinchState ? .32f : .90f)) * .28f, .50f, 1f);
         listener.onHand(clamp01(smoothX), clamp01(smoothY), imageWidth, imageHeight,
                 pinchState, openState, confidence);
     }
@@ -178,8 +219,9 @@ final class HandTracker {
         if (lastSeenMs == 0 || now - lastSeenMs > LOST_GRACE_MS) {
             pinchState = false;
             openState = false;
-            pinchTransitionFrames = 0;
-            openTransitionFrames = 0;
+            pinchEnterFrames = 0;
+            pinchExitFrames = 0;
+            openFrames = 0;
             pointerReady = false;
             if (!lostNotified) {
                 lostNotified = true;
@@ -193,7 +235,7 @@ final class HandTracker {
             int tip, int pip, float wristX, float wristY) {
         float tipD = dist(lm.get(tip).x(), lm.get(tip).y(), wristX, wristY);
         float pipD = dist(lm.get(pip).x(), lm.get(pip).y(), wristX, wristY);
-        return tipD > pipD * 1.12f;
+        return tipD > pipD * 1.10f;
     }
 
     private static float distance(
@@ -216,41 +258,6 @@ final class HandTracker {
         executor.shutdown();
     }
 
-    private static Bitmap yuv420ToBitmap(Image image, int outW, int outH) {
-        int srcW = image.getWidth();
-        int srcH = image.getHeight();
-        Image.Plane[] p = image.getPlanes();
-        ByteBuffer yb = p[0].getBuffer();
-        ByteBuffer ub = p[1].getBuffer();
-        ByteBuffer vb = p[2].getBuffer();
-        int yRow = p[0].getRowStride(), yPix = p[0].getPixelStride();
-        int uRow = p[1].getRowStride(), uPix = p[1].getPixelStride();
-        int vRow = p[2].getRowStride(), vPix = p[2].getPixelStride();
-        int[] argb = new int[outW * outH];
-        for (int oy = 0; oy < outH; oy++) {
-            int sy = Math.min(srcH - 1, oy * srcH / outH);
-            int cy = sy >> 1;
-            for (int ox = 0; ox < outW; ox++) {
-                int sx = Math.min(srcW - 1, ox * srcW / outW);
-                int cx = sx >> 1;
-                int y = yb.get(yRow * sy + yPix * sx) & 0xff;
-                int u = ub.get(uRow * cy + uPix * cx) & 0xff;
-                int v = vb.get(vRow * cy + vPix * cx) & 0xff;
-                int c = Math.max(0, y - 16);
-                int d = u - 128;
-                int e = v - 128;
-                int r = clamp255((298 * c + 409 * e + 128) >> 8);
-                int g = clamp255((298 * c - 100 * d - 208 * e + 128) >> 8);
-                int b = clamp255((298 * c + 516 * d + 128) >> 8);
-                argb[oy * outW + ox] = 0xff000000 | (r << 16) | (g << 8) | b;
-            }
-        }
-        Bitmap bitmap = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888);
-        bitmap.setPixels(argb, 0, outW, 0, 0, outW, outH);
-        return bitmap;
-    }
-
-    private static int clamp255(int v) { return v < 0 ? 0 : Math.min(255, v); }
     private static float clamp(float v, float lo, float hi) { return Math.max(lo, Math.min(hi, v)); }
     private static float clamp01(float v) { return clamp(v, 0f, 1f); }
 }
