@@ -29,19 +29,25 @@ public final class HandPinchTracker {
     }
 
     private static final String TAG = "ApertureHand";
-    private static final long MIN_FRAME_MS = 50L;
-    private static final long LOST_GRACE_MS = 260L;
+    // ~25 fps analysis. Frames are still dropped while inference is busy, so this
+    // lowers latency without allowing a backlog to build up.
+    private static final long MIN_FRAME_MS = 40L;
+    private static final long LOST_GRACE_MS = 220L;
+    // Briefly lock the cursor on pinch-down so touching thumb/index does not kick
+    // the pointer off the button. After this period a held pinch becomes a drag.
+    private static final long PINCH_LATCH_MS = 95L;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final AtomicBoolean busy = new AtomicBoolean(false);
     private final Listener listener;
     private HandLandmarker landmarker;
-    private long lastSubmitMs, lastTimestampMs, lastSeenMs;
+    private long lastSubmitMs, lastTimestampMs, lastSeenMs, pinchStartedMs;
     private boolean lostNotified = true;
     private boolean pinchState, openState, cursorReady;
     private boolean frameAnnounced, processingAnnounced, frameErrorAnnounced, detectionAnnounced;
-    private int pinchReleaseFrames, openFrames;
+    private int pinchReleaseFrames, pinchEnterFrames, openFrames;
     private float smoothX=.5f, smoothY=.5f, lastX=.5f, lastY=.5f, velX, velY;
+    private float pinchAnchorX=.5f, pinchAnchorY=.5f;
 
     public HandPinchTracker(Context context, Listener listener) {
         this.listener = listener;
@@ -174,7 +180,8 @@ public final class HandPinchTracker {
         if (result == null || result.landmarks().isEmpty()) { noHand(); return; }
         List<com.google.mediapipe.tasks.components.containers.NormalizedLandmark> lm = result.landmarks().get(0);
         if (lm.size() < 21) { noHand(); return; }
-        lastSeenMs = SystemClock.elapsedRealtime();
+        final long now = SystemClock.elapsedRealtime();
+        lastSeenMs = now;
         lostNotified = false;
         if (!detectionAnnounced) {
             detectionAnnounced = true;
@@ -182,24 +189,36 @@ public final class HandPinchTracker {
         }
 
         float wx=lm.get(0).x(), wy=lm.get(0).y();
-
-        // Use palm WIDTH as the scale reference. Wrist->middle-MCP changes a lot
-        // with perspective and was causing valid pinches to never enter the state.
         float palmWidth = Math.max(.035f, distance(lm,5,17));
         float tipDistance = distance(lm,4,8);
         float pinchRatio = tipDistance / palmWidth;
+        // Secondary measurement makes the gesture tolerant of a slightly sideways
+        // hand, where the thumb can visually overlap the index before the 2D tips
+        // become extremely close.
+        float thumbToIndexDipRatio = distance(lm,4,7) / palmWidth;
 
-        // Hysteresis: easy to press, harder to release. Also allow a small
-        // absolute threshold for hands that are very close to the camera.
-        boolean wantsPinch = tipDistance < .055f || pinchRatio < .58f;
-        boolean wantsRelease = tipDistance > .080f && pinchRatio > .82f;
-        if (!pinchState && wantsPinch) {
-            pinchState = true;
-            pinchReleaseFrames = 0;
-        } else if (pinchState && wantsRelease) {
+        boolean wantsPinch = tipDistance < .064f || pinchRatio < .68f || thumbToIndexDipRatio < .60f;
+        boolean wantsRelease = tipDistance > .086f && pinchRatio > .88f && thumbToIndexDipRatio > .76f;
+        boolean wasPinching = pinchState;
+
+        if (!pinchState) {
+            if (wantsPinch) {
+                if (++pinchEnterFrames >= 1) {
+                    pinchState = true;
+                    pinchEnterFrames = 0;
+                    pinchReleaseFrames = 0;
+                    pinchStartedMs = now;
+                    pinchAnchorX = smoothX;
+                    pinchAnchorY = smoothY;
+                }
+            } else {
+                pinchEnterFrames = 0;
+            }
+        } else if (wantsRelease) {
             if (++pinchReleaseFrames >= 2) {
                 pinchState = false;
                 pinchReleaseFrames = 0;
+                pinchEnterFrames = 0;
             }
         } else {
             pinchReleaseFrames = 0;
@@ -210,33 +229,58 @@ public final class HandPinchTracker {
         if (extended(lm,12,10,wx,wy)) extended++;
         if (extended(lm,16,14,wx,wy)) extended++;
         if (extended(lm,20,18,wx,wy)) extended++;
-        boolean wantsOpen=!pinchState && extended>=3 && pinchRatio>.90f;
+        boolean wantsOpen=!pinchState && extended>=3 && pinchRatio>.92f;
         if (wantsOpen) { if (++openFrames>=2) openState=true; }
         else { openFrames=0; openState=false; }
         if (pinchState) openState=false;
 
-        float tx=lm.get(8).x()*.90f + lm.get(7).x()*.10f;
-        float ty=lm.get(8).y()*.90f + lm.get(7).y()*.10f;
+        float tx=lm.get(8).x()*.91f + lm.get(7).x()*.09f;
+        float ty=lm.get(8).y()*.91f + lm.get(7).y()*.09f;
         if (!cursorReady) {
             smoothX=lastX=tx; smoothY=lastY=ty; velX=velY=0; cursorReady=true;
+            pinchAnchorX=smoothX; pinchAnchorY=smoothY;
         } else {
             float vx=tx-lastX, vy=ty-lastY;
-            velX=velX*.45f+vx*.55f; velY=velY*.45f+vy*.55f;
+            velX=velX*.50f+vx*.50f;
+            velY=velY*.50f+vy*.50f;
             lastX=tx; lastY=ty;
-            float motion=(float)Math.hypot(tx-smoothX,ty-smoothY);
-            float a=clamp(.64f+motion*4f,.64f,.92f);
-            if (pinchState) a=clamp(a,.58f,.82f);
-            float pred=pinchState?.17f:.25f;
-            smoothX += ((tx+velX*pred)-smoothX)*a;
-            smoothY += ((ty+velY*pred)-smoothY)*a;
+
+            // A tiny dead-zone kills fingertip landmark shimmer while preserving
+            // intentional motion. Pinch/drag gets a slightly larger dead-zone.
+            float dx=tx-smoothX, dy=ty-smoothY;
+            float motion=(float)Math.hypot(dx,dy);
+            float deadzone=pinchState ? .0042f : .0026f;
+            if (motion > deadzone) {
+                float a=clamp(.57f+motion*5.4f,.57f,.94f);
+                if (pinchState) a=clamp(a,.50f,.80f);
+                float pred=pinchState?.08f:.16f;
+                float targetX=tx+velX*pred;
+                float targetY=ty+velY*pred;
+                smoothX += (targetX-smoothX)*a;
+                smoothY += (targetY-smoothY)*a;
+            }
         }
-        listener.onHand(clamp01(smoothX),clamp01(smoothY),pinchState,openState,.85f);
+
+        float outX=smoothX, outY=smoothY;
+        if (pinchState && now-pinchStartedMs < PINCH_LATCH_MS) {
+            // Click where the cursor was immediately before the fingers closed.
+            outX=pinchAnchorX;
+            outY=pinchAnchorY;
+        } else if (wasPinching && !pinchState) {
+            // Drop accumulated velocity on release so the reticle does not flick.
+            velX*=.25f;
+            velY*=.25f;
+        }
+
+        listener.onHand(clamp01(outX),clamp01(outY),pinchState,openState,.90f);
     }
 
     private void noHand() {
         long now=SystemClock.elapsedRealtime();
         if (lastSeenMs==0 || now-lastSeenMs>LOST_GRACE_MS) {
-            pinchState=false; openState=false; pinchReleaseFrames=openFrames=0; cursorReady=false;
+            pinchState=false; openState=false;
+            pinchReleaseFrames=pinchEnterFrames=openFrames=0;
+            cursorReady=false;
             detectionAnnounced=false;
             if (!lostNotified) { lostNotified=true; listener.onHandLost(); }
         }
