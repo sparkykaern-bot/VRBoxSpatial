@@ -23,7 +23,6 @@ final class BrowserEngine {
     private static final String HOME = "https://m.youtube.com/";
 
     private final Activity activity;
-    private final FrameLayout root;
     private final Listener listener;
     private final WebView left;
     private final WebView right;
@@ -37,7 +36,6 @@ final class BrowserEngine {
 
     BrowserEngine(Activity activity, FrameLayout root, Listener listener) {
         this.activity = activity;
-        this.root = root;
         this.listener = listener;
 
         left = createWebView(false);
@@ -70,7 +68,6 @@ final class BrowserEngine {
         s.setAllowContentAccess(true);
         s.setAllowFileAccess(false);
 
-        // YouTube behaves more like Chrome when the WebView-specific marker is removed.
         String ua = s.getUserAgentString();
         if (ua != null) s.setUserAgentString(ua.replace("; wv", ""));
 
@@ -148,7 +145,6 @@ final class BrowserEngine {
         view.setX(x);
         view.setY(y);
         view.setVisibility(View.VISIBLE);
-        view.bringToFront();
     }
 
     void hide() {
@@ -232,8 +228,6 @@ final class BrowserEngine {
         @Override public void run() {
             if (!running) return;
             muteMirror();
-            // Keep the right eye close to the left eye's current page. Touches are sent to both,
-            // so this is mostly a recovery path for redirects/navigation differences.
             String lu = left.getUrl();
             String ru = right.getUrl();
             if (lu != null && !lu.isBlank() && !sameUrl(lu, ru)) {
@@ -261,15 +255,9 @@ final class BrowserEngine {
     private void destroyOne(WebView webView) {
         try {
             webView.stopLoading();
-            ViewParentSafe.remove(webView);
+            if (webView.getParent() instanceof ViewGroup) ((ViewGroup)webView.getParent()).removeView(webView);
             webView.destroy();
         } catch (Throwable ignored) { }
-    }
-
-    private static final class ViewParentSafe {
-        static void remove(WebView view) {
-            if (view.getParent() instanceof ViewGroup) ((ViewGroup)view.getParent()).removeView(view);
-        }
     }
 
     private static boolean sameUrl(String a, String b) {
