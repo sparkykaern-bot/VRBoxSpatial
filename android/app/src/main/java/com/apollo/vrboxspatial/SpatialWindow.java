@@ -11,10 +11,11 @@ final class SpatialWindow {
     final Kind kind;
     Anchor anchor;
 
-    // Snapshot of the world-space pose at the instant the user places the window.
-    // ARCore Anchors can refine their pose as the map changes; using this snapshot while
-    // worldLocked prevents a released panel from slowly drifting away on its own.
+    // Snapshot of the world-space pose at the instant this specific Anchor becomes active.
+    // ARCore may keep refining Anchor.getPose(); the UI deliberately ignores those slow
+    // corrections after the snapshot so a released panel cannot creep away by itself.
     Pose lockedPose;
+    Anchor lockedFromAnchor;
     boolean worldLocked = true;
 
     float widthMeters;
@@ -31,9 +32,12 @@ final class SpatialWindow {
         this.depthMeters = depthMeters;
     }
 
-    void lockTo(Pose pose) {
-        lockedPose = pose;
-        worldLocked = pose != null;
+    void lockToCurrentAnchor() {
+        if (anchor != null) {
+            lockedPose = anchor.getPose();
+            lockedFromAnchor = anchor;
+            worldLocked = true;
+        }
     }
 
     void detach() {
@@ -42,6 +46,7 @@ final class SpatialWindow {
             anchor = null;
         }
         lockedPose = null;
+        lockedFromAnchor = null;
         worldLocked = false;
     }
 }
