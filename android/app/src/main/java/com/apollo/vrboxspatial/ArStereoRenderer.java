@@ -1,5 +1,7 @@
 package com.apollo.vrboxspatial;
 
+import android.content.Context;
+import android.content.SharedPreferences;
 import android.opengl.GLES11Ext;
 import android.opengl.GLES20;
 import android.opengl.GLSurfaceView;
@@ -30,7 +32,11 @@ final class ArStereoRenderer implements GLSurfaceView.Renderer {
     }
 
     private static final String TAG = "ArStereoRenderer";
+    private static final String PREFS = "vrbox_optics";
+    private static final float[] COARSE_ALIGN = {-.048f,-.036f,-.024f,-.012f,0f,.012f,.024f,.036f,.048f};
+
     private final Listener listener;
+    private final SharedPreferences prefs;
     private int textureId = -1;
     private int program;
     private int aPos, uTex, uK1, uK2, uZoom, uEyeShift, uVerticalShift;
@@ -42,17 +48,27 @@ final class ArStereoRenderer implements GLSurfaceView.Renderer {
     private final float[] uv = new float[8];
     private final FloatBuffer posBuf = direct(ndc);
 
-    // Optics presets. Because generic VR Box shells have different lenses and phone-to-lens
-    // distances, CAL cycles through practical correction strengths instead of pretending one
-    // hard-coded profile is perfect for every headset.
-    private volatile int opticsPreset = 2;
-    private volatile float lensK1 = .18f;
-    private volatile float lensK2 = .045f;
-    private volatile float cameraZoom = 1.10f;
-    private volatile float fusionShift = 0.000f;
-    private volatile float verticalShift = 0.000f;
+    // Keep pre-distortion mild. The v0.4 camera was strongly warped while the Android UI was not,
+    // making passthrough and panels feel disconnected through generic lenses.
+    private volatile float lensK1 = .025f;
+    private volatile float lensK2 = .004f;
+    private volatile float cameraZoom = 1.015f;
+    private volatile float fusionShift;
+    private volatile float verticalShift = 0f;
+    private volatile int coarseIndex = 4;
 
-    ArStereoRenderer(Listener listener) { this.listener = listener; }
+    ArStereoRenderer(Listener listener) {
+        this.listener = listener;
+        SharedPreferences p = null;
+        if (listener instanceof Context) {
+            p = ((Context) listener).getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        }
+        prefs = p;
+        if (prefs != null) {
+            fusionShift = clamp(prefs.getFloat("fusion", 0f), -.08f, .08f);
+            coarseIndex = nearestCoarse(fusionShift);
+        }
+    }
 
     @Override public void onSurfaceCreated(GL10 gl, EGLConfig config) {
         GLES20.glClearColor(0f, 0f, 0f, 1f);
@@ -90,10 +106,6 @@ final class ArStereoRenderer implements GLSurfaceView.Renderer {
         Session session = listener.session();
         if (session == null || textureId <= 0) return;
         try {
-            // Critical for phone VR: each half of the screen is a complete eye image. Asking
-            // ARCore to crop the camera for the full 2:1 phone screen and then squeezing that
-            // into each half gives the wrong aspect ratio. Geometry is therefore calculated for
-            // ONE EYE (half width), then that same correctly-cropped camera image is drawn twice.
             int eyeW = Math.max(1, surfaceW / 2);
             session.setDisplayGeometry(listener.displayRotation(), eyeW, surfaceH);
 
@@ -148,30 +160,42 @@ final class ArStereoRenderer implements GLSurfaceView.Renderer {
 
     void resetSessionTexture() { textureBoundToSession = false; }
 
+    // Coarse alignment step used by the CAL button.
     void cycleOptics() {
-        opticsPreset = (opticsPreset + 1) % 5;
-        switch (opticsPreset) {
-            case 0:
-                lensK1 = 0f; lensK2 = 0f; cameraZoom = 1.00f; fusionShift = 0f;
-                break;
-            case 1:
-                lensK1 = .10f; lensK2 = .025f; cameraZoom = 1.06f; fusionShift = 0f;
-                break;
-            case 2:
-                lensK1 = .18f; lensK2 = .045f; cameraZoom = 1.10f; fusionShift = 0f;
-                break;
-            case 3:
-                lensK1 = .24f; lensK2 = .065f; cameraZoom = 1.14f; fusionShift = .010f;
-                break;
-            default:
-                lensK1 = .30f; lensK2 = .085f; cameraZoom = 1.18f; fusionShift = .020f;
-                break;
-        }
+        coarseIndex = (coarseIndex + 1) % COARSE_ALIGN.length;
+        fusionShift = COARSE_ALIGN[coarseIndex];
+        persist();
+    }
+
+    // Fine adjustment used by hardware volume keys while calibration mode is open.
+    void adjustAlignment(int direction) {
+        fusionShift = clamp(fusionShift + (direction > 0 ? .003f : -.003f), -.080f, .080f);
+        coarseIndex = nearestCoarse(fusionShift);
+        persist();
     }
 
     String opticsStatus() {
-        return String.format(Locale.US, "Lentes P%d • dist %.2f • zoom %.2f • fusão %.3f",
-                opticsPreset, lensK1, cameraZoom, fusionShift);
+        return String.format(Locale.US,
+                "Alinhamento olhos %+1.3f • crop %.3f • dist %.3f",
+                fusionShift, cameraZoom, lensK1);
+    }
+
+    private void persist() {
+        if (prefs != null) prefs.edit().putFloat("fusion", fusionShift).apply();
+    }
+
+    private static int nearestCoarse(float value) {
+        int best = 0;
+        float d = Float.MAX_VALUE;
+        for (int i=0; i<COARSE_ALIGN.length; i++) {
+            float nd = Math.abs(value - COARSE_ALIGN[i]);
+            if (nd < d) { d = nd; best = i; }
+        }
+        return best;
+    }
+
+    private static float clamp(float v, float lo, float hi) {
+        return Math.max(lo, Math.min(hi, v));
     }
 
     private static FloatBuffer direct(float[] data) {
