@@ -167,7 +167,7 @@ public class MainActivity extends Activity implements
     private void chooseBestCameraConfig(Session session) {
         try {
             CameraConfigFilter filter60 = new CameraConfigFilter(session);
-            filter60.setTargetFps(EnumSet.of(CameraConfigFilter.TargetFps.TARGET_FPS_60));
+            filter60.setTargetFps(EnumSet.of(CameraConfig.TargetFps.TARGET_FPS_60));
             List<CameraConfig> configs = session.getSupportedCameraConfigs(filter60);
             boolean asked60 = !configs.isEmpty();
             if (configs.isEmpty()) configs = session.getSupportedCameraConfigs(new CameraConfigFilter(session));
