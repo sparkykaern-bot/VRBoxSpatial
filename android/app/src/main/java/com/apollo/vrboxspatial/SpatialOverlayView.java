@@ -13,8 +13,10 @@ import android.view.View;
 import com.google.ar.core.Pose;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 
 final class SpatialOverlayView extends View {
     interface Host {
@@ -26,7 +28,9 @@ final class SpatialOverlayView extends View {
         void onWindowVisibilityChanged();
     }
 
-    private static final float IPD_METERS = 0.064f;
+    // A slightly conservative virtual IPD is easier to fuse in generic VR Box headsets whose
+    // physical lens spacing is not known precisely.
+    private static final float IPD_METERS = 0.056f;
 
     private static final class Projected {
         final SpatialWindow win;
@@ -44,28 +48,34 @@ final class SpatialOverlayView extends View {
     private final Host host;
     private final BrowserEngine browser;
     private final List<SpatialWindow> windows = new ArrayList<>();
+    private final Map<String, RectF> smoothedRects = new HashMap<>();
+    private final Map<String, RectF> leftHitRects = new HashMap<>();
 
     private Pose cameraPose = Pose.IDENTITY;
     private boolean tracking;
     private boolean handVisible;
+    private boolean handInitialized;
     private float handX = .5f, handY = .5f;
     private boolean pinch, prevPinch;
     private String handStatus = "Mão: iniciando";
     private String arStatus = "ARCore: iniciando";
     private String cameraStatus = "Câmera: automática";
-    private String opticsStatus = "Lentes: padrão";
+    private String opticsStatus = "Alinhamento: padrão";
     private String browserTitle = "YouTube";
 
     private SpatialWindow dragged;
     private SpatialWindow resized;
+    private float dragStartHandX, dragStartHandY;
     private boolean browserGesture;
+    private RectF browserGestureRect;
     private float gestureStartX, gestureStartY, browserStartNx, browserStartNy;
     private float resizeStartW, resizeStartH;
     private float resizeStartX, resizeStartY;
 
-    private float fovDeg = 88f;
-    private float uiScale = 1.12f;
+    private float fovDeg = 86f;
+    private float uiScale = 1.22f;
     private boolean showSettings;
+    private boolean calibrationMode;
     private long lastFrameMs;
     private int fps, frames;
 
@@ -81,6 +91,8 @@ final class SpatialOverlayView extends View {
     void setWindows(List<SpatialWindow> list) {
         windows.clear();
         windows.addAll(list);
+        smoothedRects.clear();
+        leftHitRects.clear();
         postInvalidateOnAnimation();
     }
 
@@ -101,7 +113,6 @@ final class SpatialOverlayView extends View {
 
     void setCameraStatus(String status) {
         if (status != null && !status.isBlank()) cameraStatus = status;
-        postInvalidateOnAnimation();
     }
 
     void setOpticsStatus(String status) {
@@ -109,10 +120,20 @@ final class SpatialOverlayView extends View {
         postInvalidateOnAnimation();
     }
 
+    boolean isCalibrationMode() { return calibrationMode; }
+
     void setHand(float nx, float ny, boolean isPinch, float confidence) {
+        float tx = clamp01(nx), ty = clamp01(ny);
+        if (!handInitialized) {
+            handX = tx; handY = ty; handInitialized = true;
+        } else {
+            // More smoothing while pinching prevents tiny MediaPipe landmark noise from becoming
+            // accidental drags/click misses.
+            float a = (pinch || isPinch) ? .24f : .42f;
+            handX += (tx - handX) * a;
+            handY += (ty - handY) * a;
+        }
         handVisible = true;
-        handX = clamp01(nx);
-        handY = clamp01(ny);
         pinch = isPinch;
         handleInteraction();
         postInvalidateOnAnimation();
@@ -127,12 +148,10 @@ final class SpatialOverlayView extends View {
 
     void setHandStatus(String status) {
         if (status != null) handStatus = status;
-        postInvalidateOnAnimation();
     }
 
     void setBrowserTitle(String title) {
         if (title != null && !title.isBlank()) browserTitle = title;
-        postInvalidateOnAnimation();
     }
 
     @Override protected void onDraw(Canvas c) {
@@ -144,6 +163,7 @@ final class SpatialOverlayView extends View {
         }
 
         int eyeW = W / 2;
+        leftHitRects.clear();
         drawVignette(c, 0, eyeW, H);
         drawVignette(c, eyeW, W - eyeW, H);
 
@@ -157,8 +177,10 @@ final class SpatialOverlayView extends View {
 
             for (SpatialWindow w : windows) {
                 if (!w.visible || w.anchor == null) continue;
-                Projected pr = project(w, eyeW, H, eyeSign);
+                Projected pr = project(w, eyeW, H, eyeSign, eye);
                 if (pr == null) continue;
+                if (eye == 0) leftHitRects.put(w.id, new RectF(pr.rect));
+
                 boolean isLive = w == liveBrowser;
                 RectF content = drawWindow(c, pr, ox, isLive);
                 if (isLive && content != null) {
@@ -192,73 +214,102 @@ final class SpatialOverlayView extends View {
 
     private void drawVignette(Canvas c, int ox, int w, int h) {
         p.setShader(new LinearGradient(ox, 0, ox + w, 0,
-                new int[]{0x66000000,0x08000000,0x08000000,0x66000000},
-                new float[]{0f,.10f,.90f,1f}, Shader.TileMode.CLAMP));
+                new int[]{0x44000000,0x00000000,0x00000000,0x44000000},
+                new float[]{0f,.08f,.92f,1f}, Shader.TileMode.CLAMP));
         c.drawRect(ox, 0, ox + w, h, p);
         p.setShader(null);
     }
 
-    private Projected project(SpatialWindow w, int eyeW, int h, float eyeSign) {
+    private Projected project(SpatialWindow w, int eyeW, int h, float eyeSign, int eyeIndex) {
         if (w.anchor == null) return null;
 
-        // Real stereo: each eye is an actual camera pose separated by human-scale IPD.
-        // This replaces the old fake pixel offset, so window depth now comes from geometry.
         Pose eyePose = cameraPose.compose(Pose.makeTranslation(eyeSign * IPD_METERS * .5f, 0f, 0f));
         float[] world = w.anchor.getPose().getTranslation();
         float[] local = eyePose.inverse().transformPoint(world);
         float z = -local[2];
-        if (z < .22f || z > 7f) return null;
+        if (z < .26f || z > 5f) return null;
 
         float hAngle = (float)Math.toDegrees(Math.atan2(local[0], z));
         float vAngle = (float)Math.toDegrees(Math.atan2(local[1], z));
-        if (Math.abs(hAngle) > 67f || Math.abs(vAngle) > 53f) return null;
+        if (Math.abs(hAngle) > 62f || Math.abs(vAngle) > 48f) return null;
 
         float f = (float)(eyeW * .5 / Math.tan(Math.toRadians(fovDeg * .5)));
         float cx = eyeW * .5f + f * (local[0] / z);
         float cy = h * .5f - f * (local[1] / z);
-
         float distance = (float)Math.sqrt(local[0]*local[0] + local[1]*local[1] + local[2]*local[2]);
-        float comfortDepth = clamp(distance, .68f, 3.2f);
-        float ww = f * (w.widthMeters / comfortDepth) * uiScale;
-        float hh = f * (w.heightMeters / comfortDepth) * uiScale;
+        float visualDepth = clamp(distance, .70f, 2.3f);
+        float ww = f * (w.widthMeters / visualDepth) * uiScale;
+        float hh = f * (w.heightMeters / visualDepth) * uiScale;
 
-        // Apple-like comfort sizing: the main browser should feel like a large floating monitor,
-        // not a tiny card. Still clamp it so it never explodes into the user's face.
-        float maxW = eyeW * (w.kind == SpatialWindow.Kind.BROWSER ? .88f : .68f);
-        float maxH = h * (w.kind == SpatialWindow.Kind.BROWSER ? .78f : .62f);
+        float maxW = eyeW * (w.kind == SpatialWindow.Kind.BROWSER ? .94f : .74f);
+        float maxH = h * (w.kind == SpatialWindow.Kind.BROWSER ? .84f : .66f);
         float maxFactor = Math.min(maxW / Math.max(1f, ww), maxH / Math.max(1f, hh));
         if (maxFactor < 1f) { ww *= maxFactor; hh *= maxFactor; }
 
-        float minW = eyeW * (w.kind == SpatialWindow.Kind.BROWSER ? .48f : .24f);
-        float minH = h * (w.kind == SpatialWindow.Kind.BROWSER ? .36f : .18f);
+        float minW = eyeW * (w.kind == SpatialWindow.Kind.BROWSER ? .64f : .30f);
+        float minH = h * (w.kind == SpatialWindow.Kind.BROWSER ? .48f : .22f);
         float minFactor = Math.max(minW / Math.max(1f, ww), minH / Math.max(1f, hh));
         if (minFactor > 1f) { ww *= minFactor; hh *= minFactor; }
 
-        if (cx + ww/2 < -60 || cx - ww/2 > eyeW + 60 || cy + hh/2 < -60 || cy - hh/2 > h + 60) return null;
-        return new Projected(w, new RectF(cx-ww/2, cy-hh/2, cx+ww/2, cy+hh/2), distance);
+        RectF target = new RectF(cx-ww/2, cy-hh/2, cx+ww/2, cy+hh/2);
+        if (w == dragged) {
+            target.offset((handX-dragStartHandX)*eyeW, (handY-dragStartHandY)*h);
+        }
+
+        if (target.right < -80 || target.left > eyeW + 80 || target.bottom < -80 || target.top > h + 80) return null;
+
+        String key = w.id + (eyeIndex == 0 ? ":L" : ":R");
+        RectF shown = smoothRect(key, target, w == dragged);
+        return new Projected(w, shown, distance);
+    }
+
+    private RectF smoothRect(String key, RectF target, boolean immediate) {
+        RectF old = smoothedRects.get(key);
+        if (old == null || immediate) {
+            RectF now = new RectF(target);
+            smoothedRects.put(key, now);
+            return new RectF(now);
+        }
+
+        float jump = (float)Math.hypot(target.centerX()-old.centerX(), target.centerY()-old.centerY());
+        float sizeJump = Math.abs(target.width()-old.width()) / Math.max(1f, old.width());
+        if (jump > Math.max(getWidth()/7f, 140f) || sizeJump > .35f) {
+            old.set(target);
+            return new RectF(old);
+        }
+
+        float a = tracking ? .30f : .16f;
+        old.left += (target.left-old.left)*a;
+        old.top += (target.top-old.top)*a;
+        old.right += (target.right-old.right)*a;
+        old.bottom += (target.bottom-old.bottom)*a;
+        return new RectF(old);
+    }
+
+    private void clearSmoothing(String id) {
+        smoothedRects.remove(id + ":L");
+        smoothedRects.remove(id + ":R");
     }
 
     private RectF drawWindow(Canvas c, Projected pr, int ox, boolean liveBrowser) {
         RectF r = new RectF(pr.rect);
         r.offset(ox, 0);
-        float radius = Math.min(28f, Math.max(12f, r.height() * .075f));
+        float radius = Math.min(30f, Math.max(13f, r.height() * .075f));
 
-        // Deep soft shadow makes the panel read as detached from the passthrough image.
-        p.setShadowLayer(34f, 0, 12f, 0xaa000000);
-        p.setColor(pr.win.kind == SpatialWindow.Kind.BROWSER ? 0x180b111a : 0xd80f1621);
+        p.setShadowLayer(38f, 0, 15f, 0xb0000000);
+        p.setColor(pr.win.kind == SpatialWindow.Kind.BROWSER ? 0x240b111a : 0xdd101722);
         c.drawRoundRect(r, radius, radius, p);
         p.clearShadowLayer();
 
-        stroke.setStrokeWidth(liveBrowser ? 2.4f : 1.8f);
-        stroke.setColor(liveBrowser ? 0x99d9eeff : 0x66cde8ff);
+        stroke.setStrokeWidth(liveBrowser ? 2.5f : 1.8f);
+        stroke.setColor(liveBrowser ? 0xa8e0f2ff : 0x66cde8ff);
         c.drawRoundRect(r, radius, radius, stroke);
 
-        float headerH = clamp(r.height() * .145f, 38f, 64f);
+        float headerH = clamp(r.height() * .13f, 40f, 66f);
         RectF header = new RectF(r.left, r.top, r.right, r.top + headerH);
-        p.setColor(0xc51a2330);
+        p.setColor(0xe01b2532);
         c.drawRoundRect(header, radius, radius, p);
-        p.setColor(0xc51a2330);
-        c.drawRect(header.left, header.bottom - radius, header.right, header.bottom, p);
+        c.drawRect(header.left, header.bottom-radius, header.right, header.bottom, p);
 
         p.setTypeface(android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.BOLD));
         p.setTextSize(clamp(headerH * .28f, 11f, 19f));
@@ -268,7 +319,7 @@ final class SpatialOverlayView extends View {
         if (pr.win.kind == SpatialWindow.Kind.BROWSER) {
             c.drawText("‹   ⌂   ↻   YT", header.left + 14, header.centerY() + 5, p);
             p.setTextAlign(Paint.Align.RIGHT);
-            c.drawText(ellipsize(title, 24), header.right - 44, header.centerY() + 5, p);
+            c.drawText(ellipsize(title, 25), header.right - 44, header.centerY() + 5, p);
             p.setTextAlign(Paint.Align.LEFT);
         } else {
             c.drawText(ellipsize(title, 26), header.left + 16, header.centerY() + 5, p);
@@ -279,18 +330,15 @@ final class SpatialOverlayView extends View {
         c.drawCircle(r.right - 20, header.centerY(), 5.5f, p);
 
         RectF body = new RectF(r.left + 7, header.bottom + 6, r.right - 7, r.bottom - 7);
-
         if (pr.win.kind == SpatialWindow.Kind.BROWSER) {
-            // The actual live WebViews sit BELOW this transparent overlay. Do not paint an opaque
-            // bitmap here: hardware video surfaces such as YouTube need to remain live.
-            p.setColor(0x10000000);
+            p.setColor(0x08000000);
             c.drawRoundRect(body, 10, 10, p);
             if (!liveBrowser) {
-                p.setColor(0xaa111722);
+                p.setColor(0xcc111722);
                 c.drawRoundRect(body, 10, 10, p);
                 p.setColor(0xccffffff);
                 p.setTextSize(clamp(body.height()*.06f, 11f, 17f));
-                c.drawText("Outra janela web • use a principal para vídeo", body.left+18, body.centerY(), p);
+                c.drawText("Janela web secundária", body.left+18, body.centerY(), p);
             }
         } else if (pr.win.kind == SpatialWindow.Kind.MEDIA) {
             drawMedia(c, body);
@@ -303,7 +351,6 @@ final class SpatialOverlayView extends View {
         float handle = clamp(r.width() * .025f, 8f, 16f);
         p.setColor(0x99ffffff);
         c.drawCircle(r.right - handle*.8f, r.bottom - handle*.8f, handle*.22f, p);
-
         return pr.win.kind == SpatialWindow.Kind.BROWSER && liveBrowser ? body : null;
     }
 
@@ -320,7 +367,7 @@ final class SpatialOverlayView extends View {
         c.drawText("YouTube", b.left+102, b.top+48, p);
         p.setTextSize(clamp(b.height()*.055f, 10f, 15f));
         p.setColor(0xc8ffffff);
-        c.drawText("Pinça neste painel para abrir vídeo real", b.left+20, b.centerY()+24, p);
+        c.drawText("Pinça para abrir na janela principal", b.left+20, b.centerY()+24, p);
     }
 
     private void drawNotes(Canvas c, RectF b) {
@@ -331,29 +378,29 @@ final class SpatialOverlayView extends View {
         c.drawText("NOTAS", b.left+16, b.top+30, p);
         p.setTextSize(clamp(b.height()*.058f, 10f, 14f));
         p.setColor(0xc0ffffff);
-        c.drawText("• Profundidade estéreo real por olho", b.left+16, b.top+62, p);
-        c.drawText("• Janela principal em distância confortável", b.left+16, b.top+88, p);
-        c.drawText("• RESET traz tudo de volta para perto", b.left+16, b.top+114, p);
+        c.drawText("• Arraste estável: anchor só ao soltar", b.left+16, b.top+62, p);
+        c.drawText("• Cursor suavizado para cliques", b.left+16, b.top+88, p);
+        c.drawText("• RESET recupera qualquer janela", b.left+16, b.top+114, p);
     }
 
     private void drawSystem(Canvas c, RectF b, float depth) {
-        p.setTextSize(clamp(b.height()*.07f, 9f, 14f));
+        p.setTextSize(clamp(b.height()*.068f, 9f, 14f));
         p.setColor(0xeaffffff);
         float y = b.top + 22;
         c.drawText(arStatus, b.left+10, y, p); y += 22;
         c.drawText(handStatus, b.left+10, y, p); y += 22;
         c.drawText(cameraStatus, b.left+10, y, p); y += 22;
-        c.drawText(String.format(Locale.US, "UI %d FPS • %.2f m • IPD 64 mm", fps, depth), b.left+10, y, p);
+        c.drawText(String.format(Locale.US, "UI %d FPS • %.2f m • vIPD 56 mm", fps, depth), b.left+10, y, p);
         p.setColor(tracking ? 0xff60f2a7 : 0xffffc857);
         c.drawCircle(b.right-18, b.top+20, 6, p);
     }
 
     private void drawDock(Canvas c, int ox, int eyeW, int H) {
-        float w = Math.min(eyeW*.86f, 560f);
-        float h = Math.min(66f, H*.12f);
-        RectF r = new RectF(ox+eyeW/2f-w/2, H-h-16, ox+eyeW/2f+w/2, H-16);
+        float w = Math.min(eyeW*.90f, 590f);
+        float h = Math.min(68f, H*.12f);
+        RectF r = new RectF(ox+eyeW/2f-w/2, H-h-14, ox+eyeW/2f+w/2, H-14);
         p.setShadowLayer(24, 0, 8, 0x88000000);
-        p.setColor(0xdd101721);
+        p.setColor(0xe0101721);
         c.drawRoundRect(r, 24, 24, p);
         p.clearShadowLayer();
         stroke.setColor(0x66cce9ff);
@@ -363,7 +410,7 @@ final class SpatialOverlayView extends View {
         String[] icons = {"YT", "WEB", "+", "RESET", "CAL", "⚙"};
         for (int i=0; i<icons.length; i++) {
             float cx = r.left + (i+.5f) * r.width()/icons.length;
-            p.setColor(i==0 ? 0x55ff3344 : 0x28ffffff);
+            p.setColor(i==0 ? 0x55ff3344 : (i==4 && calibrationMode ? 0x5579f2c0 : 0x28ffffff));
             c.drawCircle(cx, r.centerY(), h*.31f, p);
             p.setColor(Color.WHITE);
             p.setTextAlign(Paint.Align.CENTER);
@@ -374,26 +421,24 @@ final class SpatialOverlayView extends View {
     }
 
     private void drawSettings(Canvas c, int ox, int eyeW, int H) {
-        RectF r = new RectF(ox+eyeW*.07f, H*.07f, ox+eyeW*.93f, H*.34f);
-        p.setColor(0xe5111823);
+        RectF r = new RectF(ox+eyeW*.06f, H*.06f, ox+eyeW*.94f, H*.35f);
+        p.setColor(0xea111823);
         c.drawRoundRect(r, 20, 20, p);
         stroke.setColor(0x77d9eeff);
-        stroke.setStrokeWidth(1.8f);
         c.drawRoundRect(r, 20, 20, stroke);
 
         p.setColor(Color.WHITE);
         p.setTextSize(Math.max(12f, H*.027f));
-        c.drawText("AJUSTES VR BOX", r.left+16, r.top+28, p);
+        c.drawText(calibrationMode ? "CALIBRAÇÃO VR BOX" : "AJUSTES VR BOX", r.left+16, r.top+28, p);
         p.setTextSize(Math.max(9.5f, H*.019f));
         p.setColor(0xd0ffffff);
-        c.drawText(String.format(Locale.US, "FOV %.0f° • UI %.0f%% • IPD virtual 64 mm", fovDeg, uiScale*100), r.left+16, r.top+56, p);
-        c.drawText(ellipsize(opticsStatus, 48), r.left+16, r.top+80, p);
-        c.drawText("CAL troca o perfil das lentes. Escolha o que funde a câmera sem visão dupla.", r.left+16, r.top+104, p);
+        c.drawText(String.format(Locale.US, "FOV %.0f° • UI %.0f%% • vIPD 56 mm", fovDeg, uiScale*100), r.left+16, r.top+56, p);
+        c.drawText(ellipsize(opticsStatus, 52), r.left+16, r.top+80, p);
+        c.drawText("CAL = passo grosso • no modo CAL use Volume − / + para ajuste fino.", r.left+16, r.top+104, p);
     }
 
     private void drawHand(Canvas c, float x, float y, float eyeSign) {
-        // Tiny stereo separation makes the cursor feel slightly in front of the window plane.
-        float stereo = eyeSign * 3.0f;
+        float stereo = eyeSign * 2.2f;
         float rad = pinch ? 13f : 10f;
         p.setColor(pinch ? 0xff79f2c0 : 0xff81d4ff);
         p.setShadowLayer(16, 0, 0, pinch ? 0xff2bdc9a : 0xff3cb7ff);
@@ -413,9 +458,11 @@ final class SpatialOverlayView extends View {
     private void handleInteraction() {
         if (!handVisible) {
             if (prevPinch && browserGesture) finishBrowserGesture();
+            if (prevPinch && dragged != null) commitDrag(dragged);
             dragged = null;
             resized = null;
             browserGesture = false;
+            browserGestureRect = null;
             prevPinch = false;
             return;
         }
@@ -435,7 +482,7 @@ final class SpatialOverlayView extends View {
                 RectF r = hit.rect;
                 float px = handX * (getWidth()/2f);
                 float py = handY * getHeight();
-                float headerH = clamp(r.height()*.145f, 38f, 64f);
+                float headerH = clamp(r.height()*.13f, 40f, 66f);
 
                 if (px > r.right-r.width()*.12f && py > r.bottom-r.height()*.16f) {
                     resized = hit.win;
@@ -453,17 +500,20 @@ final class SpatialOverlayView extends View {
                         else if (rel < .16f) browser.home();
                         else if (rel < .24f) browser.reload();
                         else if (rel < .34f) browser.youtube();
-                        else dragged = hit.win;
+                        else beginDrag(hit.win);
                     } else {
-                        dragged = hit.win;
+                        beginDrag(hit.win);
                     }
                 } else if (hit.win.kind == SpatialWindow.Kind.BROWSER) {
-                    RectF content = browserContentRect(hit.rect);
-                    browserGesture = true;
-                    gestureStartX = handX;
-                    gestureStartY = handY;
-                    browserStartNx = (px-content.left)/Math.max(1f,content.width());
-                    browserStartNy = (py-content.top)/Math.max(1f,content.height());
+                    RectF content = browserContentRect(r);
+                    if (content.contains(px, py)) {
+                        browserGesture = true;
+                        browserGestureRect = new RectF(content);
+                        gestureStartX = handX;
+                        gestureStartY = handY;
+                        browserStartNx = clamp01((px-content.left)/Math.max(1f,content.width()));
+                        browserStartNy = clamp01((py-content.top)/Math.max(1f,content.height()));
+                    }
                 } else if (hit.win.kind == SpatialWindow.Kind.MEDIA) {
                     browser.youtube();
                     showBrowser();
@@ -471,55 +521,61 @@ final class SpatialOverlayView extends View {
             }
         }
 
-        if (pinch && dragged != null) host.moveWindowToScreen(dragged, handX, handY);
+        if (pinch && dragged != null) invalidate();
 
         if (pinch && resized != null) {
-            float dx = (handX-resizeStartX)*2.2f;
-            float dy = (handY-resizeStartY)*1.6f;
-            resized.widthMeters = clamp(resizeStartW+dx, .45f, 1.25f);
-            resized.heightMeters = clamp(resizeStartH+dy, .28f, .82f);
+            float dx = (handX-resizeStartX)*2.0f;
+            float dy = (handY-resizeStartY)*1.45f;
+            resized.widthMeters = clamp(resizeStartW+dx, .52f, 1.35f);
+            resized.heightMeters = clamp(resizeStartH+dy, .32f, .88f);
             invalidate();
         }
 
         if (up) {
             if (browserGesture) finishBrowserGesture();
+            if (dragged != null) commitDrag(dragged);
             dragged = null;
             resized = null;
             browserGesture = false;
+            browserGestureRect = null;
         }
         prevPinch = pinch;
     }
 
+    private void beginDrag(SpatialWindow w) {
+        dragged = w;
+        dragStartHandX = handX;
+        dragStartHandY = handY;
+    }
+
+    private void commitDrag(SpatialWindow w) {
+        host.moveWindowToScreen(w, handX, handY);
+        clearSmoothing(w.id);
+    }
+
     private RectF browserContentRect(RectF r) {
-        float headerH = clamp(r.height()*.145f, 38f, 64f);
+        float headerH = clamp(r.height()*.13f, 40f, 66f);
         return new RectF(r.left+7, r.top+headerH+6, r.right-7, r.bottom-7);
     }
 
     private void finishBrowserGesture() {
-        Projected hit = findBrowserProjection();
-        if (hit == null) return;
-        RectF content = browserContentRect(hit.rect);
+        if (browserGestureRect == null) return;
         float px = handX*(getWidth()/2f);
         float py = handY*getHeight();
-        float endNx = (px-content.left)/Math.max(1f,content.width());
-        float endNy = (py-content.top)/Math.max(1f,content.height());
+        float endNx = clamp01((px-browserGestureRect.left)/Math.max(1f,browserGestureRect.width()));
+        float endNy = clamp01((py-browserGestureRect.top)/Math.max(1f,browserGestureRect.height()));
         float moved = (float)Math.hypot(handX-gestureStartX, handY-gestureStartY);
-        if (moved < .025f) browser.tap(browserStartNx, browserStartNy);
+        // Larger dead-zone because MediaPipe fingers naturally jitter a few pixels.
+        if (moved < .040f) browser.tap(browserStartNx, browserStartNy);
         else browser.drag(browserStartNx, browserStartNy, endNx, endNy);
-    }
-
-    private Projected findBrowserProjection() {
-        int eyeW = Math.max(1, getWidth()/2);
-        SpatialWindow w = firstVisibleBrowser();
-        return w == null ? null : project(w, eyeW, getHeight(), -1f);
     }
 
     private boolean handleDockHit() {
         int eyeW = getWidth()/2;
         int H = getHeight();
-        float w = Math.min(eyeW*.86f, 560f);
-        float h = Math.min(66f, H*.12f);
-        RectF r = new RectF(eyeW/2f-w/2, H-h-16, eyeW/2f+w/2, H-16);
+        float w = Math.min(eyeW*.90f, 590f);
+        float h = Math.min(68f, H*.12f);
+        RectF r = new RectF(eyeW/2f-w/2, H-h-14, eyeW/2f+w/2, H-14);
         float px = handX*eyeW, py = handY*H;
         if (!r.contains(px,py)) return false;
 
@@ -535,9 +591,12 @@ final class SpatialOverlayView extends View {
         } else if (idx == 3) {
             host.resetLayout();
         } else if (idx == 4) {
+            calibrationMode = true;
+            showSettings = true;
             host.cycleOptics();
         } else {
             showSettings = !showSettings;
+            if (!showSettings) calibrationMode = false;
         }
         performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
         return true;
@@ -569,9 +628,9 @@ final class SpatialOverlayView extends View {
         float px = nx*eyeW, py = ny*H;
         for (int i=windows.size()-1; i>=0; i--) {
             SpatialWindow w = windows.get(i);
-            if (!w.visible || w.anchor == null) continue;
-            Projected pr = project(w, eyeW, H, -1f);
-            if (pr != null && pr.rect.contains(px,py)) return pr;
+            if (!w.visible) continue;
+            RectF r = leftHitRects.get(w.id);
+            if (r != null && r.contains(px,py)) return new Projected(w, new RectF(r), w.depthMeters);
         }
         return null;
     }
@@ -580,8 +639,8 @@ final class SpatialOverlayView extends View {
         int eyeW = Math.max(1, getWidth()/2);
         int H = Math.max(1, getHeight());
         float f = (float)(eyeW*.5/Math.tan(Math.toRadians(fovDeg*.5)));
-        float x = (nx*eyeW-eyeW*.5f)/f;
-        float y = -(ny*H-H*.5f)/f;
+        float x = (clamp(nx,.10f,.90f)*eyeW-eyeW*.5f)/f;
+        float y = -(clamp(ny,.10f,.86f)*H-H*.5f)/f;
         float len = (float)Math.sqrt(x*x+y*y+1f);
         return new float[]{x/len, y/len, -1f/len};
     }
@@ -589,9 +648,9 @@ final class SpatialOverlayView extends View {
     Pose cameraPose() { return cameraPose; }
 
     float depthFor(SpatialWindow w) {
-        // Moving a window happens on a stable comfort plane instead of preserving a noisy z value
-        // from a momentary hand pose. This prevents windows shooting meters away during a pinch.
-        return clamp(w.depthMeters, .78f, 1.35f);
+        if (w.kind == SpatialWindow.Kind.BROWSER) return .84f;
+        if (w.kind == SpatialWindow.Kind.MEDIA) return .94f;
+        return 1.00f;
     }
 
     private static String ellipsize(String s, int max) {
