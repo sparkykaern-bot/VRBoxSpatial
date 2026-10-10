@@ -7,6 +7,8 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.media.Image;
 import android.os.Bundle;
+import android.util.Range;
+import android.util.Size;
 import android.view.Surface;
 import android.view.View;
 import android.view.WindowManager;
@@ -16,6 +18,8 @@ import android.widget.Toast;
 
 import com.google.ar.core.ArCoreApk;
 import com.google.ar.core.Camera;
+import com.google.ar.core.CameraConfig;
+import com.google.ar.core.CameraConfigFilter;
 import com.google.ar.core.Config;
 import com.google.ar.core.Coordinates2d;
 import com.google.ar.core.Frame;
@@ -27,7 +31,9 @@ import com.google.ar.core.exceptions.NotYetAvailableException;
 import com.google.ar.core.exceptions.UnavailableException;
 
 import java.util.ArrayList;
+import java.util.EnumSet;
 import java.util.List;
+import java.util.Locale;
 
 public class MainActivity extends Activity implements
         ArStereoRenderer.Listener,
@@ -45,6 +51,8 @@ public class MainActivity extends Activity implements
     private boolean installRequested;
     private boolean uiBuilt;
     private boolean anchorsReady;
+    private String cameraStatus = "Câmera AR: automática";
+    private long lastAnchorMoveMs;
     private final Object windowLock = new Object();
     private final List<SpatialWindow> windows = new ArrayList<>();
 
@@ -88,6 +96,7 @@ public class MainActivity extends Activity implements
 
         createWindowModels();
         overlay.setWindows(windows);
+        overlay.setCameraStatus(cameraStatus);
 
         root.setOnLongClickListener(v -> {
             requestUrlEntry();
@@ -98,10 +107,10 @@ public class MainActivity extends Activity implements
     private void createWindowModels() {
         synchronized (windowLock) {
             windows.clear();
-            windows.add(new SpatialWindow("browser-main", "Navegador", SpatialWindow.Kind.BROWSER, .92f, .62f, 1.28f));
-            windows.add(new SpatialWindow("media", "Mídia", SpatialWindow.Kind.MEDIA, .62f, .38f, 1.42f));
-            windows.add(new SpatialWindow("notes", "Notas", SpatialWindow.Kind.NOTES, .56f, .42f, 1.58f));
-            windows.add(new SpatialWindow("system", "Sistema", SpatialWindow.Kind.SYSTEM, .50f, .32f, 1.72f));
+            windows.add(new SpatialWindow("browser-main", "YouTube / Navegador", SpatialWindow.Kind.BROWSER, .82f, .54f, 1.85f));
+            windows.add(new SpatialWindow("media", "YouTube", SpatialWindow.Kind.MEDIA, .56f, .34f, 2.00f));
+            windows.add(new SpatialWindow("notes", "Notas", SpatialWindow.Kind.NOTES, .52f, .38f, 2.15f));
+            windows.add(new SpatialWindow("system", "Sistema", SpatialWindow.Kind.SYSTEM, .52f, .34f, 2.15f));
         }
     }
 
@@ -142,14 +151,53 @@ public class MainActivity extends Activity implements
                 return false;
             }
             arSession = new Session(this);
+            chooseBestCameraConfig(arSession);
             Config cfg = new Config(arSession);
             cfg.setFocusMode(Config.FocusMode.AUTO);
             cfg.setUpdateMode(Config.UpdateMode.LATEST_CAMERA_IMAGE);
             arSession.configure(cfg);
+            if (overlay != null) overlay.setCameraStatus(cameraStatus);
             return true;
         } catch (UnavailableException | RuntimeException e) {
             fallbackLegacy("ARCore não está disponível neste aparelho.");
             return false;
+        }
+    }
+
+    private void chooseBestCameraConfig(Session session) {
+        try {
+            CameraConfigFilter filter60 = new CameraConfigFilter(session);
+            filter60.setTargetFps(EnumSet.of(CameraConfigFilter.TargetFps.TARGET_FPS_60));
+            List<CameraConfig> configs = session.getSupportedCameraConfigs(filter60);
+            boolean asked60 = !configs.isEmpty();
+            if (configs.isEmpty()) configs = session.getSupportedCameraConfigs(new CameraConfigFilter(session));
+            if (configs.isEmpty()) {
+                cameraStatus = "Câmera AR: padrão";
+                return;
+            }
+
+            CameraConfig best = null;
+            long bestScore = Long.MIN_VALUE;
+            for (CameraConfig c : configs) {
+                Size tex = c.getTextureSize();
+                Size img = c.getImageSize();
+                Range<Integer> fps = c.getFpsRange();
+                long texArea = (long)tex.getWidth() * tex.getHeight();
+                long imgArea = (long)img.getWidth() * img.getHeight();
+                long score = texArea * 4L + imgArea;
+                if (fps != null && fps.getUpper() >= 60) score += 10_000_000_000L;
+                if (score > bestScore) { best = c; bestScore = score; }
+            }
+
+            if (best != null) {
+                session.setCameraConfig(best);
+                Size tex = best.getTextureSize();
+                Range<Integer> fps = best.getFpsRange();
+                int maxFps = fps == null ? (asked60 ? 60 : 30) : fps.getUpper();
+                cameraStatus = String.format(Locale.US, "Câmera AR: %dx%d até %d FPS", tex.getWidth(), tex.getHeight(), maxFps);
+            }
+        } catch (Throwable t) {
+            cameraStatus = "Câmera AR: modo compatível";
         }
     }
 
@@ -201,6 +249,7 @@ public class MainActivity extends Activity implements
                 float conf = rawHandConfidence;
                 runOnUiThread(() -> {
                     overlay.updateCameraPose(displayPose, tracking);
+                    overlay.setCameraStatus(cameraStatus);
                     overlay.setHand(out[0], out[1], hp, conf);
                 });
             } catch (Throwable t) {
@@ -209,6 +258,7 @@ public class MainActivity extends Activity implements
         } else {
             runOnUiThread(() -> {
                 overlay.updateCameraPose(displayPose, tracking);
+                overlay.setCameraStatus(cameraStatus);
                 overlay.clearHand();
             });
         }
@@ -223,16 +273,18 @@ public class MainActivity extends Activity implements
         catch (Throwable ignored) { }
     }
 
-    @Override public void onRendererError(String message) { runOnUiThread(() -> Toast.makeText(this, message, Toast.LENGTH_SHORT).show()); }
+    @Override public void onRendererError(String message) {
+        runOnUiThread(() -> Toast.makeText(this, message, Toast.LENGTH_SHORT).show());
+    }
 
     private void createDefaultAnchors(Pose pose) {
         if (arSession == null) return;
         synchronized (windowLock) {
             if (windows.size() < 4) return;
-            setAnchor(windows.get(0), pose.compose(Pose.makeTranslation(-.34f, -.02f, -1.28f)));
-            setAnchor(windows.get(1), pose.compose(Pose.makeTranslation(.48f, .02f, -1.42f)));
-            setAnchor(windows.get(2), pose.compose(Pose.makeTranslation(-.42f, .38f, -1.58f)));
-            setAnchor(windows.get(3), pose.compose(Pose.makeTranslation(.45f, .38f, -1.72f)));
+            setAnchor(windows.get(0), pose.compose(Pose.makeTranslation(-.30f, -.03f, -1.85f)));
+            setAnchor(windows.get(1), pose.compose(Pose.makeTranslation(.52f, .02f, -2.00f)));
+            setAnchor(windows.get(2), pose.compose(Pose.makeTranslation(-.44f, .34f, -2.15f)));
+            setAnchor(windows.get(3), pose.compose(Pose.makeTranslation(.45f, .34f, -2.15f)));
             anchorsReady = true;
         }
         runOnUiThread(() -> overlay.setWindows(windows));
@@ -253,6 +305,10 @@ public class MainActivity extends Activity implements
 
     @Override public void moveWindowToScreen(SpatialWindow window, float nx, float ny) {
         if (glView == null || arSession == null || overlay == null) return;
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (now - lastAnchorMoveMs < 70) return;
+        lastAnchorMoveMs = now;
+
         final float[] ray = overlay.screenRay(nx, ny);
         final float depth = overlay.depthFor(window);
         final Pose pose = overlay.cameraPose();
@@ -283,8 +339,8 @@ public class MainActivity extends Activity implements
         glView.queueEvent(() -> {
             SpatialWindow w;
             synchronized (windowLock) {
-                w = new SpatialWindow("browser-" + System.currentTimeMillis(), "Navegador", SpatialWindow.Kind.BROWSER, .78f, .52f, 1.55f);
-                Pose wp = pose.compose(Pose.makeTranslation(0f, -.28f, -1.55f));
+                w = new SpatialWindow("browser-" + System.currentTimeMillis(), "Navegador", SpatialWindow.Kind.BROWSER, .72f, .48f, 1.95f);
+                Pose wp = pose.compose(Pose.makeTranslation(0f, -.24f, -1.95f));
                 w.anchor = arSession.createAnchor(Pose.makeTranslation(wp.tx(), wp.ty(), wp.tz()));
                 windows.add(w);
             }
@@ -296,7 +352,7 @@ public class MainActivity extends Activity implements
         runOnUiThread(() -> {
             EditText edit = new EditText(this);
             edit.setSingleLine(true);
-            edit.setHint("Site ou pesquisa");
+            edit.setHint("Site, vídeo ou pesquisa");
             edit.setTextColor(android.graphics.Color.WHITE);
             edit.setHintTextColor(0xffaab4c5);
             edit.setBackgroundColor(0xff1a2230);
@@ -306,6 +362,7 @@ public class MainActivity extends Activity implements
                     .setTitle("Abrir no navegador espacial")
                     .setView(edit)
                     .setPositiveButton("Abrir", (d,w) -> browser.open(edit.getText().toString()))
+                    .setNeutralButton("YouTube", (d,w) -> browser.youtube())
                     .setNegativeButton("Cancelar", null)
                     .show();
         });
