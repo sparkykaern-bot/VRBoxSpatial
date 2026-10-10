@@ -41,6 +41,7 @@ public class MainActivity extends Activity implements
         SpatialOverlayView.Host {
 
     private static final int REQ_CAMERA = 50;
+
     private FrameLayout root;
     private android.opengl.GLSurfaceView glView;
     private ArStereoRenderer renderer;
@@ -48,11 +49,13 @@ public class MainActivity extends Activity implements
     private BrowserEngine browser;
     private HandTracker handTracker;
     private Session arSession;
+
     private boolean installRequested;
     private boolean uiBuilt;
     private boolean anchorsReady;
     private String cameraStatus = "Câmera AR: automática";
     private long lastAnchorMoveMs;
+
     private final Object windowLock = new Object();
     private final List<SpatialWindow> windows = new ArrayList<>();
 
@@ -75,6 +78,7 @@ public class MainActivity extends Activity implements
     private void buildUi() {
         if (uiBuilt) return;
         uiBuilt = true;
+
         root = new FrameLayout(this);
         root.setBackgroundColor(android.graphics.Color.BLACK);
         setContentView(root);
@@ -85,18 +89,26 @@ public class MainActivity extends Activity implements
         renderer = new ArStereoRenderer(this);
         glView.setRenderer(renderer);
         glView.setRenderMode(android.opengl.GLSurfaceView.RENDERMODE_CONTINUOUSLY);
-        root.addView(glView, new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+        root.addView(glView, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT));
 
+        // Live browser surfaces are inserted above the camera surface and below the spatial UI.
         browser = new BrowserEngine(this, root, title -> {
             if (overlay != null) runOnUiThread(() -> overlay.setBrowserTitle(title));
         });
+
         overlay = new SpatialOverlayView(this, this, browser);
-        root.addView(overlay, new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+        root.addView(overlay, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT));
+
         handTracker = new HandTracker(this, this);
 
         createWindowModels();
         overlay.setWindows(windows);
         overlay.setCameraStatus(cameraStatus);
+        overlay.setOpticsStatus(renderer.opticsStatus());
 
         root.setOnLongClickListener(v -> {
             requestUrlEntry();
@@ -107,16 +119,25 @@ public class MainActivity extends Activity implements
     private void createWindowModels() {
         synchronized (windowLock) {
             windows.clear();
-            windows.add(new SpatialWindow("browser-main", "YouTube / Navegador", SpatialWindow.Kind.BROWSER, .82f, .54f, 1.85f));
-            windows.add(new SpatialWindow("media", "YouTube", SpatialWindow.Kind.MEDIA, .56f, .34f, 2.00f));
-            windows.add(new SpatialWindow("notes", "Notas", SpatialWindow.Kind.NOTES, .52f, .38f, 2.15f));
-            windows.add(new SpatialWindow("system", "Sistema", SpatialWindow.Kind.SYSTEM, .52f, .34f, 2.15f));
+            // Distances are deliberately around 1 meter: a large floating monitor rather than a
+            // tiny panel meters away. depthMeters is also the stable drag plane for each window.
+            windows.add(new SpatialWindow("browser-main", "YouTube / Navegador", SpatialWindow.Kind.BROWSER,
+                    .98f, .64f, .95f));
+            windows.add(new SpatialWindow("media", "YouTube", SpatialWindow.Kind.MEDIA,
+                    .62f, .38f, 1.05f));
+            windows.add(new SpatialWindow("notes", "Notas", SpatialWindow.Kind.NOTES,
+                    .62f, .42f, 1.10f));
+            windows.add(new SpatialWindow("system", "Sistema", SpatialWindow.Kind.SYSTEM,
+                    .64f, .40f, 1.10f));
         }
     }
 
     @Override protected void onResume() {
-        super.onResume(); immersive();
-        if (!uiBuilt && checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) buildUi();
+        super.onResume();
+        immersive();
+        if (!uiBuilt && checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+            buildUi();
+        }
         if (!uiBuilt) return;
         if (!ensureArSession()) return;
         try {
@@ -137,7 +158,9 @@ public class MainActivity extends Activity implements
     @Override protected void onDestroy() {
         if (handTracker != null) handTracker.close();
         if (browser != null) browser.destroy();
-        synchronized (windowLock) { for (SpatialWindow w : windows) w.detach(); }
+        synchronized (windowLock) {
+            for (SpatialWindow w : windows) w.detach();
+        }
         if (arSession != null) arSession.close();
         super.onDestroy();
     }
@@ -150,13 +173,19 @@ public class MainActivity extends Activity implements
                 installRequested = true;
                 return false;
             }
+
             arSession = new Session(this);
             chooseBestCameraConfig(arSession);
+
             Config cfg = new Config(arSession);
             cfg.setFocusMode(Config.FocusMode.AUTO);
             cfg.setUpdateMode(Config.UpdateMode.LATEST_CAMERA_IMAGE);
             arSession.configure(cfg);
-            if (overlay != null) overlay.setCameraStatus(cameraStatus);
+
+            if (overlay != null) {
+                overlay.setCameraStatus(cameraStatus);
+                overlay.setOpticsStatus(renderer.opticsStatus());
+            }
             return true;
         } catch (UnavailableException | RuntimeException e) {
             fallbackLegacy("ARCore não está disponível neste aparelho.");
@@ -186,7 +215,10 @@ public class MainActivity extends Activity implements
                 long imgArea = (long)img.getWidth() * img.getHeight();
                 long score = texArea * 4L + imgArea;
                 if (fps != null && fps.getUpper() >= 60) score += 10_000_000_000L;
-                if (score > bestScore) { best = c; bestScore = score; }
+                if (score > bestScore) {
+                    best = c;
+                    bestScore = score;
+                }
             }
 
             if (best != null) {
@@ -194,7 +226,9 @@ public class MainActivity extends Activity implements
                 Size tex = best.getTextureSize();
                 Range<Integer> fps = best.getFpsRange();
                 int maxFps = fps == null ? (asked60 ? 60 : 30) : fps.getUpper();
-                cameraStatus = String.format(Locale.US, "Câmera AR: %dx%d até %d FPS", tex.getWidth(), tex.getHeight(), maxFps);
+                cameraStatus = String.format(Locale.US,
+                        "Câmera AR: %dx%d até %d FPS",
+                        tex.getWidth(), tex.getHeight(), maxFps);
             }
         } catch (Throwable t) {
             cameraStatus = "Câmera AR: modo compatível";
@@ -210,16 +244,20 @@ public class MainActivity extends Activity implements
     }
 
     private void immersive() {
-        getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY |
-                View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION |
-                View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION |
+        getWindow().getDecorView().setSystemUiVisibility(
+                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY |
+                View.SYSTEM_UI_FLAG_FULLSCREEN |
+                View.SYSTEM_UI_FLAG_HIDE_NAVIGATION |
+                View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN |
+                View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION |
                 View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
     }
 
     @Override public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-        if (requestCode == REQ_CAMERA && grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) buildUi();
-        else if (requestCode == REQ_CAMERA) {
+        if (requestCode == REQ_CAMERA && grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            buildUi();
+        } else if (requestCode == REQ_CAMERA) {
             Toast.makeText(this, "A câmera é necessária para o passthrough.", Toast.LENGTH_LONG).show();
             finish();
         }
@@ -244,12 +282,17 @@ public class MainActivity extends Activity implements
             float[] in = {rawHandX * rawHandW, rawHandY * rawHandH};
             float[] out = new float[2];
             try {
-                frame.transformCoordinates2d(Coordinates2d.IMAGE_PIXELS, in, Coordinates2d.VIEW_NORMALIZED, out);
+                frame.transformCoordinates2d(
+                        Coordinates2d.IMAGE_PIXELS,
+                        in,
+                        Coordinates2d.VIEW_NORMALIZED,
+                        out);
                 boolean hp = rawHandPinch;
                 float conf = rawHandConfidence;
                 runOnUiThread(() -> {
                     overlay.updateCameraPose(displayPose, tracking);
                     overlay.setCameraStatus(cameraStatus);
+                    overlay.setOpticsStatus(renderer.opticsStatus());
                     overlay.setHand(out[0], out[1], hp, conf);
                 });
             } catch (Throwable t) {
@@ -259,6 +302,7 @@ public class MainActivity extends Activity implements
             runOnUiThread(() -> {
                 overlay.updateCameraPose(displayPose, tracking);
                 overlay.setCameraStatus(cameraStatus);
+                overlay.setOpticsStatus(renderer.opticsStatus());
                 overlay.clearHand();
             });
         }
@@ -269,8 +313,9 @@ public class MainActivity extends Activity implements
         try {
             Image image = frame.acquireCameraImage();
             handTracker.submit(image, frame.getTimestamp());
-        } catch (NotYetAvailableException ignored) { }
-        catch (Throwable ignored) { }
+        } catch (NotYetAvailableException ignored) {
+        } catch (Throwable ignored) {
+        }
     }
 
     @Override public void onRendererError(String message) {
@@ -281,10 +326,13 @@ public class MainActivity extends Activity implements
         if (arSession == null) return;
         synchronized (windowLock) {
             if (windows.size() < 4) return;
-            setAnchor(windows.get(0), pose.compose(Pose.makeTranslation(-.30f, -.03f, -1.85f)));
-            setAnchor(windows.get(1), pose.compose(Pose.makeTranslation(.52f, .02f, -2.00f)));
-            setAnchor(windows.get(2), pose.compose(Pose.makeTranslation(-.44f, .34f, -2.15f)));
-            setAnchor(windows.get(3), pose.compose(Pose.makeTranslation(.45f, .34f, -2.15f)));
+
+            // Main screen centered and close. Side panels are slightly farther and offset so they
+            // read as a spatial workspace instead of four flat cards on one plane.
+            setAnchor(windows.get(0), pose.compose(Pose.makeTranslation(0f, -.02f, -.95f)));
+            setAnchor(windows.get(1), pose.compose(Pose.makeTranslation(.67f, .02f, -1.05f)));
+            setAnchor(windows.get(2), pose.compose(Pose.makeTranslation(-.72f, .28f, -1.10f)));
+            setAnchor(windows.get(3), pose.compose(Pose.makeTranslation(.72f, .30f, -1.10f)));
             anchorsReady = true;
         }
         runOnUiThread(() -> overlay.setWindows(windows));
@@ -295,26 +343,44 @@ public class MainActivity extends Activity implements
         w.anchor = arSession.createAnchor(Pose.makeTranslation(pose.tx(), pose.ty(), pose.tz()));
     }
 
-    @Override public void onHand(float imageX, float imageY, int imageWidth, int imageHeight, boolean isPinch, float confidence) {
-        rawHandX = imageX; rawHandY = imageY; rawHandW = imageWidth; rawHandH = imageHeight;
-        rawHandPinch = isPinch; rawHandConfidence = confidence; rawHandVisible = true;
+    @Override public void onHand(float imageX, float imageY, int imageWidth, int imageHeight,
+                                 boolean isPinch, float confidence) {
+        rawHandX = imageX;
+        rawHandY = imageY;
+        rawHandW = imageWidth;
+        rawHandH = imageHeight;
+        rawHandPinch = isPinch;
+        rawHandConfidence = confidence;
+        rawHandVisible = true;
     }
 
-    @Override public void onHandLost() { rawHandVisible = false; rawHandPinch = false; }
-    @Override public void onHandStatus(String status) { if (overlay != null) runOnUiThread(() -> overlay.setHandStatus(status)); }
+    @Override public void onHandLost() {
+        rawHandVisible = false;
+        rawHandPinch = false;
+    }
+
+    @Override public void onHandStatus(String status) {
+        if (overlay != null) runOnUiThread(() -> overlay.setHandStatus(status));
+    }
 
     @Override public void moveWindowToScreen(SpatialWindow window, float nx, float ny) {
         if (glView == null || arSession == null || overlay == null) return;
+
         long now = android.os.SystemClock.elapsedRealtime();
-        if (now - lastAnchorMoveMs < 70) return;
+        if (now - lastAnchorMoveMs < 75) return;
         lastAnchorMoveMs = now;
 
         final float[] ray = overlay.screenRay(nx, ny);
         final float depth = overlay.depthFor(window);
         final Pose pose = overlay.cameraPose();
+
         glView.queueEvent(() -> {
-            float[] local = {ray[0] * depth, ray[1] * depth, ray[2] * depth};
+            // Use a fixed comfort depth. x/y follow the hand ray, z does not drift with hand noise.
+            float rayZ = Math.max(.15f, -ray[2]);
+            float scale = depth / rayZ;
+            float[] local = {ray[0] * scale, ray[1] * scale, -depth};
             float[] world = pose.transformPoint(local);
+
             synchronized (windowLock) {
                 if (window.anchor != null) window.anchor.detach();
                 window.anchor = arSession.createAnchor(Pose.makeTranslation(world[0], world[1], world[2]));
@@ -329,6 +395,9 @@ public class MainActivity extends Activity implements
         final Pose pose = overlay.cameraPose();
         glView.queueEvent(() -> {
             anchorsReady = false;
+            synchronized (windowLock) {
+                for (SpatialWindow w : windows) w.visible = true;
+            }
             createDefaultAnchors(pose);
         });
     }
@@ -339,8 +408,14 @@ public class MainActivity extends Activity implements
         glView.queueEvent(() -> {
             SpatialWindow w;
             synchronized (windowLock) {
-                w = new SpatialWindow("browser-" + System.currentTimeMillis(), "Navegador", SpatialWindow.Kind.BROWSER, .72f, .48f, 1.95f);
-                Pose wp = pose.compose(Pose.makeTranslation(0f, -.24f, -1.95f));
+                w = new SpatialWindow(
+                        "browser-" + System.currentTimeMillis(),
+                        "Navegador",
+                        SpatialWindow.Kind.BROWSER,
+                        .82f,
+                        .54f,
+                        1.05f);
+                Pose wp = pose.compose(Pose.makeTranslation(.35f, -.22f, -1.05f));
                 w.anchor = arSession.createAnchor(Pose.makeTranslation(wp.tx(), wp.ty(), wp.tz()));
                 windows.add(w);
             }
@@ -352,12 +427,13 @@ public class MainActivity extends Activity implements
         runOnUiThread(() -> {
             EditText edit = new EditText(this);
             edit.setSingleLine(true);
-            edit.setHint("Site, vídeo ou pesquisa");
+            edit.setHint("Vídeo, canal, pesquisa ou site");
             edit.setTextColor(android.graphics.Color.WHITE);
             edit.setHintTextColor(0xffaab4c5);
             edit.setBackgroundColor(0xff1a2230);
             int pad = (int)(16 * getResources().getDisplayMetrics().density);
-            edit.setPadding(pad,pad,pad,pad);
+            edit.setPadding(pad, pad, pad, pad);
+
             new AlertDialog.Builder(this)
                     .setTitle("Abrir no navegador espacial")
                     .setView(edit)
@@ -368,5 +444,14 @@ public class MainActivity extends Activity implements
         });
     }
 
-    @Override public void onWindowVisibilityChanged() { if (overlay != null) overlay.invalidate(); }
+    @Override public void cycleOptics() {
+        if (renderer == null) return;
+        renderer.cycleOptics();
+        if (overlay != null) overlay.setOpticsStatus(renderer.opticsStatus());
+        Toast.makeText(this, renderer.opticsStatus(), Toast.LENGTH_SHORT).show();
+    }
+
+    @Override public void onWindowVisibilityChanged() {
+        if (overlay != null) overlay.invalidate();
+    }
 }
