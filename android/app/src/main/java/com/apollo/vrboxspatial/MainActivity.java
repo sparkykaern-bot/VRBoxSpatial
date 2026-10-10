@@ -119,14 +119,29 @@ public class MainActivity extends Activity implements
     private void createWindowModels() {
         synchronized (windowLock) {
             windows.clear();
-            windows.add(new SpatialWindow("browser-main", "YouTube / Navegador", SpatialWindow.Kind.BROWSER,
-                    1.12f, .70f, .84f));
-            windows.add(new SpatialWindow("media", "YouTube", SpatialWindow.Kind.MEDIA,
-                    .66f, .40f, .94f));
-            windows.add(new SpatialWindow("notes", "Notas", SpatialWindow.Kind.NOTES,
-                    .64f, .42f, 1.00f));
-            windows.add(new SpatialWindow("system", "Sistema", SpatialWindow.Kind.SYSTEM,
-                    .66f, .42f, 1.00f));
+
+            SpatialWindow main = new SpatialWindow(
+                    "browser-main", "YouTube / Navegador", SpatialWindow.Kind.BROWSER,
+                    .82f, .48f, 1.04f);
+            windows.add(main);
+
+            SpatialWindow media = new SpatialWindow(
+                    "media", "YouTube", SpatialWindow.Kind.MEDIA,
+                    .54f, .32f, 1.12f);
+            media.visible = false;
+            windows.add(media);
+
+            SpatialWindow notes = new SpatialWindow(
+                    "notes", "Notas", SpatialWindow.Kind.NOTES,
+                    .52f, .34f, 1.12f);
+            notes.visible = false;
+            windows.add(notes);
+
+            SpatialWindow system = new SpatialWindow(
+                    "system", "Sistema", SpatialWindow.Kind.SYSTEM,
+                    .54f, .34f, 1.12f);
+            system.visible = false;
+            windows.add(system);
         }
     }
 
@@ -325,10 +340,10 @@ public class MainActivity extends Activity implements
         if (arSession == null) return;
         synchronized (windowLock) {
             if (windows.size() < 4) return;
-            setAnchor(windows.get(0), pose.compose(Pose.makeTranslation(0f, -.02f, -.84f)));
-            setAnchor(windows.get(1), pose.compose(Pose.makeTranslation(.62f, .03f, -.94f)));
-            setAnchor(windows.get(2), pose.compose(Pose.makeTranslation(-.66f, .26f, -1.00f)));
-            setAnchor(windows.get(3), pose.compose(Pose.makeTranslation(.66f, .27f, -1.00f)));
+            setAnchor(windows.get(0), pose.compose(Pose.makeTranslation(0f, -.01f, -1.04f)));
+            setAnchor(windows.get(1), pose.compose(Pose.makeTranslation(.58f, .03f, -1.12f)));
+            setAnchor(windows.get(2), pose.compose(Pose.makeTranslation(-.58f, .22f, -1.12f)));
+            setAnchor(windows.get(3), pose.compose(Pose.makeTranslation(.58f, .22f, -1.12f)));
             anchorsReady = true;
         }
         runOnUiThread(() -> overlay.setWindows(windows));
@@ -358,8 +373,8 @@ public class MainActivity extends Activity implements
 
     @Override public void moveWindowToScreen(SpatialWindow window, float nx, float ny) {
         if (glView == null || arSession == null || overlay == null || window == null) return;
-        final float safeX = clamp(nx, .16f, .84f);
-        final float safeY = clamp(ny, .16f, .78f);
+        final float safeX = clamp(nx, .18f, .82f);
+        final float safeY = clamp(ny, .18f, .76f);
         final float[] ray = overlay.screenRay(safeX, safeY);
         final float depth = overlay.depthFor(window);
         final Pose pose = overlay.cameraPose();
@@ -367,8 +382,8 @@ public class MainActivity extends Activity implements
         glView.queueEvent(() -> {
             float rayZ = Math.max(.24f, -ray[2]);
             float scale = depth / rayZ;
-            float localX = clamp(ray[0] * scale, -depth*.62f, depth*.62f);
-            float localY = clamp(ray[1] * scale, -depth*.40f, depth*.40f);
+            float localX = clamp(ray[0] * scale, -depth*.56f, depth*.56f);
+            float localY = clamp(ray[1] * scale, -depth*.34f, depth*.34f);
             float[] world = pose.transformPoint(new float[]{localX, localY, -depth});
             synchronized (windowLock) {
                 if (window.anchor != null) window.anchor.detach();
@@ -384,7 +399,11 @@ public class MainActivity extends Activity implements
         final Pose pose = overlay.cameraPose();
         glView.queueEvent(() -> {
             anchorsReady = false;
-            synchronized (windowLock) { for (SpatialWindow w : windows) w.visible = true; }
+            synchronized (windowLock) {
+                for (int i = 0; i < windows.size(); i++) {
+                    windows.get(i).visible = (i == 0);
+                }
+            }
             createDefaultAnchors(pose);
         });
     }
@@ -396,8 +415,8 @@ public class MainActivity extends Activity implements
             SpatialWindow w;
             synchronized (windowLock) {
                 w = new SpatialWindow("browser-" + System.currentTimeMillis(), "Navegador",
-                        SpatialWindow.Kind.BROWSER, .92f, .60f, .90f);
-                Pose wp = pose.compose(Pose.makeTranslation(.28f, -.20f, -.90f));
+                        SpatialWindow.Kind.BROWSER, .72f, .43f, 1.08f);
+                Pose wp = pose.compose(Pose.makeTranslation(.28f, -.14f, -1.08f));
                 w.anchor = arSession.createAnchor(Pose.makeTranslation(wp.tx(), wp.ty(), wp.tz()));
                 windows.add(w);
             }
